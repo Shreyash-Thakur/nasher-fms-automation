@@ -1,5 +1,6 @@
 import io
 import json
+import base64
 import os
 import re
 import warnings
