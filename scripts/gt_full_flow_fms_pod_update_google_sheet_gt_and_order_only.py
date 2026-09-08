@@ -60,7 +60,7 @@ DELIVERED_TEXT = "Delivered"
 def connect_google_apis():
     print("\nConnecting to Google Drive + Google Sheets...")
 
-        scopes = [
+    scopes = [
         "https://www.googleapis.com/auth/drive.readonly",
         "https://www.googleapis.com/auth/spreadsheets",
     ]
@@ -72,6 +72,7 @@ def connect_google_apis():
         except json.JSONDecodeError:
             info = json.loads(base64.b64decode(raw))
         credentials = Credentials.from_service_account_info(info, scopes=scopes)
+        print("Using service-account credentials from GCP_SA_KEY env var")
     else:
         if not os.path.exists(SERVICE_ACCOUNT_FILE):
             raise FileNotFoundError(
@@ -81,11 +82,7 @@ def connect_google_apis():
         credentials = Credentials.from_service_account_file(
             SERVICE_ACCOUNT_FILE, scopes=scopes
         )
-
-    print(
-        f"Service account: "
-        f"{credentials.service_account_email}"
-    )
+        print(f"Service account: {credentials.service_account_email}")
 
     http = httplib2.Http(timeout=60)
 
