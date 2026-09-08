@@ -236,6 +236,11 @@ def get_google_credentials():
     )
 
 
+creds = get_google_credentials()
+drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
+sheets_service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+
+
 # ============================================================
 # GOOGLE DRIVE HELPERS
 # ============================================================
