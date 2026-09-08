@@ -20,7 +20,12 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run script
+      - name: Run Full Flow FMS script
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
         run: python scripts/gt_full_flow_fms_yes_no_all_or_latest.py
+
+      - name: Run POD update script
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        run: python scripts/gt_full_flow_fms_pod_update_google_sheet_gt_and_order_only.py
