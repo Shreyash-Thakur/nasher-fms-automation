@@ -1,4 +1,6 @@
 import os
+import json
+import base64
 from datetime import datetime, timedelta, date
 import time
 import random
@@ -399,23 +401,26 @@ def resolve_stage_actual(row_values, col_actual, planned_dt, row, updates):
 def connect_google_sheets():
     print("\nConnecting to Google Sheets...")
 
-    if not os.path.exists(SERVICE_ACCOUNT_FILE):
-        raise FileNotFoundError(
-            "\nService account JSON not found:\n"
-            f"{SERVICE_ACCOUNT_FILE}"
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+
+    raw = os.environ.get("GCP_SA_KEY")
+    if raw:
+        try:
+            info = json.loads(raw)
+        except json.JSONDecodeError:
+            info = json.loads(base64.b64decode(raw))
+        credentials = Credentials.from_service_account_info(info, scopes=scopes)
+        print("Using service-account credentials from GCP_SA_KEY env var")
+    else:
+        if not os.path.exists(SERVICE_ACCOUNT_FILE):
+            raise FileNotFoundError(
+                "\nService account JSON not found:\n"
+                f"{SERVICE_ACCOUNT_FILE}"
+            )
+        credentials = Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_FILE, scopes=scopes
         )
-
-    credentials = Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE,
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-        ],
-    )
-
-    print(
-        f"Service account: "
-        f"{credentials.service_account_email}"
-    )
+        print(f"Service account: {credentials.service_account_email}")
 
     http = httplib2.Http(timeout=60)
     authorized_http = AuthorizedHttp(
