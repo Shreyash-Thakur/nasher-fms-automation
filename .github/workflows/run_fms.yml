@@ -29,3 +29,8 @@ jobs:
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
         run: python scripts/gt_full_flow_fms_pod_update_google_sheet_gt_and_order_only.py
+
+      - name: Run planned status script
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        run: python scripts/gt_full_flow_fms_planned_status_google_sheet_alerts_quota_fixed_v3.py
