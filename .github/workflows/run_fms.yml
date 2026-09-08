@@ -1,1 +1,24 @@
+name: GT FMS Automation
 
+on:
+  workflow_dispatch:        # lets you run it manually with a button
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run script
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        run: python scripts/gt_full_flow_fms_yes_no_all_or_latest.py
