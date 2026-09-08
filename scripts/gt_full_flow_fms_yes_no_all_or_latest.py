@@ -191,6 +191,20 @@ def find_credentials_file():
 
 
 def get_google_credentials():
+    # GitHub Actions path: key comes from the GCP_SA_KEY environment variable
+    raw = os.environ.get("GCP_SA_KEY")
+    if raw:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            data = json.loads(base64.b64decode(raw))
+        creds = service_account.Credentials.from_service_account_info(
+            data, scopes=SCOPES
+        )
+        print("Using service-account credentials from GCP_SA_KEY env var")
+        return creds
+
+    # Local path: read the key from your PC folder (unchanged)
     credentials_file = find_credentials_file()
 
     with open(credentials_file, "r", encoding="utf-8") as f:
@@ -219,11 +233,6 @@ def get_google_credentials():
         f"Unsupported Google credential JSON type in: {credentials_file}\n"
         f"Expected 'service_account' or 'authorized_user'."
     )
-
-
-creds = get_google_credentials()
-drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
-sheets_service = build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 
 # ============================================================
