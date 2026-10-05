@@ -37,7 +37,12 @@
     cells: 5,201 · still without a Vinculum match: 661 · extra Vinculum lines not placed: 1 (GT230926A3||NMHPP80069QM)`.
     Spot-check: row 6887 = GT050926A1 / NMH81133GS → would get `N051601`, Team `Process6`, Warehouse `GGN 1`, Dispatched 8
     of 10, Invoice Amount 14,136 (= 8 × 1,767); New GT FMS independently shows `N051601 / Process6` for all three lines.
-  - Write enabled 2026-10-05 after review (workflow default `write`); result of the first write run in its log.
+  - Write enabled 2026-10-05 after review (workflow default `write`). First write run 37294051229: `Backfill complete:
+    5,201 cells written.` (743 rows); POD step in the same run: `POD matched : 3,015 · Total cell updates: 21,971`.
+  - Sheet re-counted after the run (gviz count per form month): Order No Sep **40 → 775** / 1,315, Oct 0 → 8 / 92;
+    POD Copy / Delivered Date / Order Delivery Status Sep **39 → 256**. Aug unchanged at 363 / 590 — its 227 blank rows
+    are 123 `Cancelled` (skipped by design) + 104 with no Vinculum line. Cross-check: New GT FMS has Order No for
+    794 / 1,365 Sep rows, Full Flow now 775 / 1,315 — the remaining blanks are orders not (yet) in Vinculum.
 - **Blast radius:** writes only blank cells in existing Full Flow rows (P, Q, S, AS, AW, AX, AY, X, V). Consumers:
   POD sync (will now match these rows), planned-status script, FMS_Dashboard (`dashboard.js`), GT Fulfilment web app
   (`Pod_*`). The append path for new GTs is unchanged (parity-tested).
