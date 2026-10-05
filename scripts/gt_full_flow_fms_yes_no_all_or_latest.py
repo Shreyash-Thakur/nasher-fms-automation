@@ -1137,21 +1137,12 @@ def apply_historical_cancellation(fms_df, sales_df):
 # BUILD FULL FLOW
 # ============================================================
 
-def build_full_flow(fms_df, sales_df, pick_pack_df, warehouse_mapping):
-    print("\nCreating Sales match keys...")
-
-    fms_df["_MATCH_KEY"] = fms_df.apply(
-        lambda row: create_match_key(row["GT Number"], row["Vinculum SKU"]),
-        axis=1,
-    )
-
+def build_sales_lookup(sales_df):
+    """Prepare Order Enquiry rows (parse Order Date / Pick Qty / Total, add the GT+SKU
+    match key) and group them by key. Mutates and returns sales_df, like before."""
     sales_df["_MATCH_KEY"] = sales_df.apply(
         lambda row: create_match_key(row["ExtOrderNo"], row["SKU Code"]),
         axis=1,
-    )
-
-    fms_df["Form Received Time"] = pd.to_datetime(
-        fms_df["Form Received Time"], errors="coerce", dayfirst=True
     )
 
     # Order Enquiry Order Date is yyyy-mm-dd hh:mm:ss. Parse it explicitly.
@@ -1183,6 +1174,15 @@ def build_full_flow(fms_df, sales_df, pick_pack_df, warehouse_mapping):
         sales_df["Total"], errors="coerce"
     )
 
+    sales_groups = {
+        key: group
+        for key, group in sales_df.groupby("_MATCH_KEY", sort=False)
+    }
+    return sales_groups, sales_df
+
+
+def build_pick_pack_lookup(pick_pack_df):
+    """Order No -> latest valid Pick Date + corresponding Pick User."""
     print("Parsing Pick Pack Pick Date...")
     pick_pack_df["_RAW_PICK_DATE"] = pick_pack_df["Pick Date"]
     pick_pack_df["Pick Date"] = pick_pack_df["Pick Date"].apply(parse_pick_date)
@@ -1197,12 +1197,6 @@ def build_full_flow(fms_df, sales_df, pick_pack_df, warehouse_mapping):
         for value in raw[raw != ""].head(15):
             print(f"  {value!r}")
         raise SystemExit("Pick Date parsing produced 0 valid dates.")
-
-    # Sales lookup
-    sales_groups = {
-        key: group
-        for key, group in sales_df.groupby("_MATCH_KEY", sort=False)
-    }
 
     # Pick Pack lookup - latest valid Pick Date + corresponding user.
     pick_pack_df["_NORMALIZED_ORDER_NO"] = pick_pack_df["Order No"].map(normalize_value)
@@ -1238,6 +1232,24 @@ def build_full_flow(fms_df, sales_df, pick_pack_df, warehouse_mapping):
             "Pick Date": selected_pick_date,
             "Pick User": selected_pick_user,
         }
+    return pick_pack_lookup
+
+
+def build_full_flow(fms_df, sales_df, pick_pack_df, warehouse_mapping):
+    print("\nCreating Sales match keys...")
+
+    fms_df["_MATCH_KEY"] = fms_df.apply(
+        lambda row: create_match_key(row["GT Number"], row["Vinculum SKU"]),
+        axis=1,
+    )
+
+    fms_df["Form Received Time"] = pd.to_datetime(
+        fms_df["Form Received Time"], errors="coerce", dayfirst=True
+    )
+
+    # Sales lookup (parses Order Date / Pick Qty / Total) and Pick Pack lookup.
+    sales_groups, sales_df = build_sales_lookup(sales_df)
+    pick_pack_lookup = build_pick_pack_lookup(pick_pack_df)
 
     full_flow_rows = []
     matched_fms_count = 0
@@ -1372,6 +1384,156 @@ def build_full_flow(fms_df, sales_df, pick_pack_df, warehouse_mapping):
 
 
 # ============================================================
+# BACKFILL EXISTING ROWS (blank Order No)
+# ============================================================
+# Why: processing is incremental — a GT is appended once and never revisited. GTs
+# appended before their Vinculum order existed kept a blank Order No (P) forever, so
+# P/Q/S/AS/AW/AX/AY (and, downstream, the GT+Order POD match) stayed empty.
+# Sep-2026: 40 of 1,315 rows had an Order No. This fills ONLY blank cells of existing
+# rows, with the same GT + Vinculum SKU match as build_full_flow, every night.
+#
+# BACKFILL_MODE env: "dry-run" (count + log, write nothing), "write", "off".
+
+BACKFILL_MODE = os.environ.get("BACKFILL_MODE", "dry-run").strip().lower()
+
+# Output column <- how to get the value from a matched Order Enquiry row.
+BACKFILL_FIELDS = [
+    ("Order No", lambda s, wh: s["Order No"]),                    # P
+    ("Team", lambda s, wh: s["Created by"]),                      # Q
+    ("Actual", lambda s, wh: s["Order Date"]),                    # S
+    ("Invoice No", lambda s, wh: s["Invoice No"]),                # AW
+    ("Invoice Amount", lambda s, wh: s["Total"]),                 # AY
+    ("Warehouse", lambda s, wh: wh.get(normalize_value(s["Originating warehouse"]),
+                                       str(s["Originating warehouse"]).strip())),  # AX
+    ("Dispatched Qty", lambda s, wh: s["Pick Qty"]),              # AS
+]
+
+
+def _is_cancelled_row(row):
+    return any(
+        str(row.get(c, "")).strip().lower() == "cancelled"
+        for c in ("Order No", "Order Quantity", "Status", "Dispatched Qty")
+    )
+
+
+def plan_backfill(existing_df, sales_groups, pick_pack_lookup, warehouse_mapping):
+    """Return (writes, stats). writes = [(sheet_row, output_column, value)].
+
+    existing_df row i is sheet row 8 + i (read from A8 with every row padded, so no
+    rows are dropped). Only blank cells of rows with a blank Order No are written.
+    """
+    stats = {"rows_considered": 0, "rows_filled": 0, "rows_still_unmatched": 0,
+             "cells": 0, "unplaced_sales_lines": 0, "unplaced_keys": []}
+    writes = []
+
+    by_key = {}
+    for i, row in existing_df.iterrows():
+        key = create_match_key(row["GT Number"], row["Vinculum SKU"])
+        if key != "||":
+            by_key.setdefault(key, []).append((i, row))
+
+    for key, rows in by_key.items():
+        blank_rows = [(i, r) for i, r in rows
+                      if not value_found(r["Order No"]) and not _is_cancelled_row(r)]
+        if not blank_rows:
+            continue
+        stats["rows_considered"] += len(blank_rows)
+
+        if key not in sales_groups:
+            stats["rows_still_unmatched"] += len(blank_rows)
+            continue
+
+        used = {normalize_value(r["Order No"]) for _, r in rows if value_found(r["Order No"])}
+        candidates = [s for _, s in sales_groups[key].iterrows()
+                      if normalize_value(s["Order No"]) not in used]
+
+        if len(candidates) > len(blank_rows):
+            stats["unplaced_sales_lines"] += len(candidates) - len(blank_rows)
+            stats["unplaced_keys"].append(key)
+        if len(candidates) < len(blank_rows):
+            stats["rows_still_unmatched"] += len(blank_rows) - len(candidates)
+
+        for (i, row), sale in zip(blank_rows, candidates):
+            sheet_row = 8 + int(i)
+            row_cells = []
+            for column, getter in BACKFILL_FIELDS:
+                value = getter(sale, warehouse_mapping)
+                if value_found(value) and not value_found(row[column]):
+                    row_cells.append((sheet_row, column, value))
+
+            pick = pick_pack_lookup.get(normalize_value(sale["Order No"]))
+            if pick:
+                if pick["Pick Date"] is not None and not pd.isna(pick["Pick Date"]) \
+                        and not value_found(row["Actual.1"]):
+                    row_cells.append((sheet_row, "Actual.1",
+                                      pd.Timestamp(pick["Pick Date"]).to_pydatetime()))
+                if value_found(pick["Pick User"]) and not value_found(row["Warehouse Team"]):
+                    row_cells.append((sheet_row, "Warehouse Team", pick["Pick User"]))
+
+            if row_cells:
+                stats["rows_filled"] += 1
+                stats["cells"] += len(row_cells)
+                writes.extend(row_cells)
+
+    return writes, stats
+
+
+def backfill_a1(sheet_row, column):
+    n, letters = OUTPUT_COLUMNS.index(column) + 1, ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        letters = chr(65 + r) + letters
+    return f"'{FULL_FLOW_SHEET_NAME}'!{letters}{sheet_row}"
+
+
+def run_backfill(existing_df, sales_df, pick_pack_df, warehouse_mapping):
+    print("\n" + "=" * 80)
+    print(f"BACKFILL EXISTING ROWS (blank Order No)  —  mode: {BACKFILL_MODE}")
+    print("=" * 80)
+    if BACKFILL_MODE == "off":
+        print("Backfill disabled.")
+        return
+
+    # Work on copies: build_full_flow parses these frames again later.
+    sales_groups, _ = build_sales_lookup(sales_df.copy())
+    try:
+        pick_pack_lookup = build_pick_pack_lookup(pick_pack_df.copy())
+    except SystemExit:
+        pick_pack_lookup = {}
+
+    writes, stats = plan_backfill(existing_df, sales_groups, pick_pack_lookup, warehouse_mapping)
+
+    print(f"Rows with blank Order No considered: {stats['rows_considered']:,}")
+    print(f"Rows that would be / are filled:     {stats['rows_filled']:,}")
+    print(f"Cells that would be / are written:   {stats['cells']:,}")
+    print(f"Rows still without a Vinculum match: {stats['rows_still_unmatched']:,}")
+    print(f"Extra Vinculum lines not placed:     {stats['unplaced_sales_lines']:,} "
+          f"(GT+SKU keys: {len(stats['unplaced_keys']):,})")
+    for key in stats["unplaced_keys"][:20]:
+        print(f"  unplaced: {key}")
+    per_col = {}
+    for _, column, _ in writes:
+        per_col[column] = per_col.get(column, 0) + 1
+    for column, count in per_col.items():
+        print(f"  {column:<16} {count:,}")
+    for sheet_row, column, value in writes[:15]:
+        print(f"  sample: row {sheet_row} {column} = {clean_for_google(value)!r}")
+
+    if BACKFILL_MODE != "write" or not writes:
+        print("DRY RUN — nothing written." if BACKFILL_MODE != "write" else "Nothing to write.")
+        return
+
+    data = [{"range": backfill_a1(r, c), "values": [[clean_for_google(v)]]} for r, c, v in writes]
+    for start in range(0, len(data), 500):
+        sheets_service.spreadsheets().values().batchUpdate(
+            spreadsheetId=OUTPUT_SPREADSHEET_ID,
+            body={"valueInputOption": "USER_ENTERED", "data": data[start:start + 500]},
+        ).execute()
+        print(f"  Written cells {start + 1:,} - {min(start + 500, len(data)):,}")
+    print(f"Backfill complete: {len(data):,} cells written.")
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
@@ -1411,6 +1573,10 @@ def main():
     output_sheet_id = get_output_sheet()
     existing_full_flow_df = read_existing_full_flow()
     processed_gt_numbers = get_processed_gt_numbers(existing_full_flow_df)
+
+    # Fill blank Order No (and dependent fields) on rows already in Full Flow.
+    # Runs every night, before the "no new GTs" early exit below.
+    run_backfill(existing_full_flow_df, sales_df, pick_pack_df, warehouse_mapping)
 
     fms_to_process = filter_unprocessed_fms(
         fms_df,

@@ -4,6 +4,13 @@ on:
   schedule:
     - cron: '30 19 * * *'   # daily at 1:00 AM IST (19:30 UTC)
   workflow_dispatch:          # keeps the manual "Run workflow" button too
+    inputs:
+      backfill_mode:
+        description: 'Backfill blank Order No on existing Full Flow rows: dry-run (log only) / write / off'
+        required: false
+        default: 'dry-run'
+        type: choice
+        options: ['dry-run', 'write', 'off']
 
 jobs:
   run:
@@ -23,6 +30,8 @@ jobs:
       - name: Run Full Flow FMS script
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          # Scheduled runs: dry-run until the backfill counts are reviewed, then switch to write.
+          BACKFILL_MODE: ${{ github.event.inputs.backfill_mode || 'dry-run' }}
         run: python scripts/gt_full_flow_fms_yes_no_all_or_latest.py
 
       - name: Run POD update script
