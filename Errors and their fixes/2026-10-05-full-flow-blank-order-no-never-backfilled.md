@@ -33,13 +33,15 @@
     used lines not reused, extras reported, Pick-Pack bridge, row/A1 mapping).
   - Refactor parity: old (HEAD) vs new `build_full_flow` on the same inputs (incl. one GT expanding to 2 rows and an
     unparseable date) → `PARITY OK: old and new build_full_flow identical on 4 output rows`.
-  - Live dry-run counts: see the GitHub Actions run log ("BACKFILL EXISTING ROWS … mode: dry-run") — to be reviewed
-    before switching to `write`.
+  - Live dry-run (run 37291985617, 2026-10-05): `Rows with blank Order No considered: 1,404 · would be filled: 743 ·
+    cells: 5,201 · still without a Vinculum match: 661 · extra Vinculum lines not placed: 1 (GT230926A3||NMHPP80069QM)`.
+    Spot-check: row 6887 = GT050926A1 / NMH81133GS → would get `N051601`, Team `Process6`, Warehouse `GGN 1`, Dispatched 8
+    of 10, Invoice Amount 14,136 (= 8 × 1,767); New GT FMS independently shows `N051601 / Process6` for all three lines.
+  - Write enabled 2026-10-05 after review (workflow default `write`); result of the first write run in its log.
 - **Blast radius:** writes only blank cells in existing Full Flow rows (P, Q, S, AS, AW, AX, AY, X, V). Consumers:
   POD sync (will now match these rows), planned-status script, FMS_Dashboard (`dashboard.js`), GT Fulfilment web app
   (`Pod_*`). The append path for new GTs is unchanged (parity-tested).
 - **Still open:**
-  - Shipped in **dry-run** — nothing is written until the counts are reviewed and `BACKFILL_MODE` is set to `write`.
   - GT+SKU keys with more Vinculum lines than Full Flow rows (split shipments) are reported, not expanded into new rows.
   - Stage columns that have no source at all (Full Flow X/AA/AB/AF/AG/AK/AL/AO only filled for April) are not addressed.
 - **Related:** `GT_FMS/Errors and their fixes/2026-10-01-pending-pod-always-zero.md` (same sheet; POD rule).

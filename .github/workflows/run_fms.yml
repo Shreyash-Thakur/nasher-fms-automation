@@ -8,7 +8,7 @@ on:
       backfill_mode:
         description: 'Backfill blank Order No on existing Full Flow rows: dry-run (log only) / write / off'
         required: false
-        default: 'dry-run'
+        default: 'write'
         type: choice
         options: ['dry-run', 'write', 'off']
 
@@ -30,8 +30,8 @@ jobs:
       - name: Run Full Flow FMS script
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
-          # Scheduled runs: dry-run until the backfill counts are reviewed, then switch to write.
-          BACKFILL_MODE: ${{ github.event.inputs.backfill_mode || 'dry-run' }}
+          # Scheduled runs write (dry-run reviewed 2026-10-05: 743 rows / 5,201 cells, spot-checked).
+          BACKFILL_MODE: ${{ github.event.inputs.backfill_mode || 'write' }}
         run: python scripts/gt_full_flow_fms_yes_no_all_or_latest.py
 
       - name: Run POD update script
