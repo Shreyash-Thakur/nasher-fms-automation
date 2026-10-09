@@ -881,6 +881,7 @@ def build_pod_index(drive):
 # POD indexes are populated once in main() and then used by the row matcher.
 exact_index = {}
 gt_index = {}
+closed_skipped = 0   # rows with a POD that were left alone because they are closed
 
 
 # ============================================================
@@ -1044,18 +1045,23 @@ def is_blank_value(value):
     return value is None or str(value).strip() == ""
 
 
+# Lines a human (GT_FMS dashboard Cancel GT / Mark Virtual Invoice) or an earlier
+# job closed. GT_FMS markVirtualGT_ writes "Virtual Invoice" into ONLY AJ on punched
+# lines (P:AW on open lines); Cancel writes "Cancelled" into P:AW. Before 2026-10-09
+# only C / P / AP were checked, so a punched Virtual Invoice line (AJ only) was
+# overwritten with "Delivered" whenever a POD file matched.
+CLOSED_MARKERS = {"cancelled", "virtual invoice", "out of stock", "oos"}
+CLOSED_MARKER_COLUMNS = [COL_GT] + list(range(COL_ORDER, COL_AV + 1))   # C, P:AV
+
+
 def row_is_cancelled(row):
     """
-    True if this row is a Cancelled order, which must NEVER be marked
-    Delivered.
-
-    A cancelled order carries the literal text "Cancelled" across its
-    cells (GT Number, Order No, and the stage columns all read
-    "Cancelled"). Checking a few representative columns is enough and
-    is robust to a single stray value.
+    True if this row is closed (Cancelled / Virtual Invoice / Out of stock / OOS
+    in C or anywhere in P:AV — includes AJ). Closed rows are never written: not
+    AJ "Delivered", not AP / AU / AV.
     """
-    for column_number in (COL_GT, COL_ORDER, COL_AP):
-        if get_cell(row, column_number).strip().lower() == "cancelled":
+    for column_number in CLOSED_MARKER_COLUMNS:
+        if get_cell(row, column_number).strip().lower() in CLOSED_MARKERS:
             return True
     return False
 
@@ -1086,6 +1092,8 @@ def build_sheet_update_requests(values):
     normalized_gt_matches = 0
 
     updates = []
+    global closed_skipped
+    closed_skipped = 0
 
     for offset, row in enumerate(values):
         row_num = DATA_START_ROW + offset
@@ -1109,6 +1117,11 @@ def build_sheet_update_requests(values):
             continue
 
         matched += 1
+
+        # Closed line (Cancelled / Virtual Invoice / OOS): leave it exactly as is.
+        if row_is_cancelled(row):
+            closed_skipped += 1
+            continue
 
         if match_type == "GT + Order":
             exact_matches += 1
@@ -1167,10 +1180,7 @@ def build_sheet_update_requests(values):
         # Guard against Cancelled orders (their cells read "Cancelled",
         # which must never become "Delivered"), and skip the write if
         # AJ already reads "Delivered".
-        if (
-            not row_is_cancelled(row)
-            and current_aj != DELIVERED_TEXT
-        ):
+        if current_aj != DELIVERED_TEXT:
             updates.append({
                 "range": f"'{SHEET_NAME}'!{aj_cell}",
                 "values": [[DELIVERED_TEXT]],
@@ -1336,6 +1346,7 @@ def main():
     print(f"Rows checked             : {rows_checked:,}")
     print(f"POD matched              : {matched:,}")
     print(f"POD not found            : {missed:,}")
+    print(f"Closed rows left alone   : {closed_skipped:,} (Cancelled / Virtual Invoice / OOS with a POD)")
 
     print("-" * 80)
 

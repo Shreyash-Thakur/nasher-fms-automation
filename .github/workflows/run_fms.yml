@@ -6,7 +6,10 @@ on:
   workflow_dispatch:          # keeps the manual "Run workflow" button too
     inputs:
       backfill_mode:
-        description: 'Backfill blank Order No on existing Full Flow rows: dry-run (log only) / write / off'
+        description: >-
+          write = normal nightly run. dry-run = Full Flow script logs what it would
+          fill / refresh / append and writes NOTHING (POD + planned-status steps are
+          skipped too). off = no fill/refresh, new rows still appended.
         required: false
         default: 'write'
         type: choice
@@ -15,6 +18,9 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
+    env:
+      # Scheduled runs have no inputs -> write.
+      BACKFILL_MODE: ${{ github.event.inputs.backfill_mode || 'write' }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -25,21 +31,39 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        id: install
+        run: pip install -r requirements.txt pytest
+
+      # Offline tests (no Google access). If they fail, the Full Flow step is skipped
+      # (it would write with broken matching); POD + planned status still run.
+      - name: Run tests
+        id: tests
+        run: python -m pytest tests -q
 
       - name: Run Full Flow FMS script
+        id: fullflow
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
-          # Scheduled runs write (dry-run reviewed 2026-10-05: 743 rows / 5,201 cells, spot-checked).
-          BACKFILL_MODE: ${{ github.event.inputs.backfill_mode || 'write' }}
         run: python scripts/gt_full_flow_fms_yes_no_all_or_latest.py
 
+      - name: Upload Full Flow reports (suspect cancellations, unmatched rows)
+        if: ${{ !cancelled() && steps.fullflow.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: fullflow-reports
+          path: reports/
+          if-no-files-found: ignore
+
+      # The next two run even if an earlier step failed (a Full Flow failure must not
+      # stop POD / planned-status updates); skipped only on a manual dry-run.
       - name: Run POD update script
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && env.BACKFILL_MODE != 'dry-run' }}
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
         run: python scripts/gt_full_flow_fms_pod_update_google_sheet_gt_and_order_only.py
 
       - name: Run planned status script
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && env.BACKFILL_MODE != 'dry-run' }}
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
         run: python scripts/gt_full_flow_fms_planned_status_google_sheet_alerts_quota_fixed_v3.py

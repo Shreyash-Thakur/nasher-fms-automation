@@ -55,7 +55,14 @@ PICK_PACK_FOLDER_ID = "1Xi66o4A0I3GdtlNrh61XcEWNkT5UKmey"
 # Put "YES" to mark FMS rows that are NOT found in Order Enquiry
 # as Cancelled from column T through AW, only up to the cutoff date.
 # Put "NO" to completely disable this logic.
-ENABLE_HISTORICAL_CANCELLATION = "YES"
+#
+# 2026-10-09: set to "NO". "No Vinculum match" is NOT evidence of cancellation —
+# the match was exact-GT only, so GT Finals with an R/T/F approval suffix never
+# matched and were stamped "Cancelled" (then skipped by every later fill). Same
+# failure as GT_FMS_v2_DEPRECATED invoice2.js (2026-09-23 record). Rows already
+# stamped are NOT reverted automatically; see report_suspect_cancellations().
+# See "Errors and their fixes/2026-10-09-full-flow-rows-empty-suffix-and-refresh.md".
+ENABLE_HISTORICAL_CANCELLATION = "NO"
 
 # Change this date whenever you need a different historical cutoff.
 # The cutoff is inclusive: 15-Aug-2026 is included.
@@ -537,39 +544,6 @@ def read_existing_full_flow():
     return existing_df
 
 
-def get_processed_gt_numbers(existing_df):
-    """Return GTs already present in the destination Full Flow FMS."""
-    if existing_df.empty or "GT Number" not in existing_df.columns:
-        return set()
-
-    processed = set()
-    for value in existing_df["GT Number"]:
-        key = normalize_value(value)
-        if key:
-            processed.add(key)
-
-    return processed
-
-
-def filter_unprocessed_fms(fms_df, processed_gt_numbers):
-    """Keep only FMS rows belonging to GTs not already processed."""
-    if not processed_gt_numbers:
-        print("  No previously processed GTs found. All FMS rows are eligible.")
-        return fms_df.copy()
-
-    gt_keys = fms_df["GT Number"].map(normalize_value)
-    already_processed_mask = gt_keys.isin(processed_gt_numbers)
-
-    skipped_rows = int(already_processed_mask.sum())
-    new_df = fms_df.loc[~already_processed_mask].copy()
-
-    print(f"  FMS rows already processed: {skipped_rows:,}")
-    print(f"  FMS rows to process now:    {len(new_df):,}")
-    print(f"  Already processed GTs:      {len(processed_gt_numbers):,}")
-
-    return new_df
-
-
 def write_full_flow(sheet_id, df, start_row=8):
     print(
         f"Writing Full Flow data to destination "
@@ -953,6 +927,7 @@ def read_sales_file():
                 skipped_tabs.append(tab_name)
                 continue
 
+            df["_TAB"] = tab_name   # used to drop rows duplicated across month tabs
             sales_dataframes.append(df)
             included_tabs.append(tab_name)
             print(f"  INCLUDED - {len(df):,} rows")
@@ -1235,21 +1210,20 @@ def build_pick_pack_lookup(pick_pack_df):
     return pick_pack_lookup
 
 
-def build_full_flow(fms_df, sales_df, pick_pack_df, warehouse_mapping):
-    print("\nCreating Sales match keys...")
+def build_full_flow(fms_df, assigned, pick_pack_lookup, warehouse_mapping):
+    """Build output rows for FMS rows being appended.
 
-    fms_df["_MATCH_KEY"] = fms_df.apply(
-        lambda row: create_match_key(row["GT Number"], row["Vinculum SKU"]),
-        axis=1,
-    )
+    assigned[pos] = list of Order Enquiry lines (Series) that allocate_lines() gave
+    to the pos-th fms_df row ([] = no Vinculum line yet; the row is appended with a
+    blank Order No and the nightly fill picks it up later). One output row per line,
+    so a GT+SKU punched as several Vinculum orders expands to several rows (as before).
+    """
+    print("\nBuilding Full Flow rows to append...")
 
+    fms_df = fms_df.copy()
     fms_df["Form Received Time"] = pd.to_datetime(
         fms_df["Form Received Time"], errors="coerce", dayfirst=True
     )
-
-    # Sales lookup (parses Order Date / Pick Qty / Total) and Pick Pack lookup.
-    sales_groups, sales_df = build_sales_lookup(sales_df)
-    pick_pack_lookup = build_pick_pack_lookup(pick_pack_df)
 
     full_flow_rows = []
     matched_fms_count = 0
@@ -1261,27 +1235,19 @@ def build_full_flow(fms_df, sales_df, pick_pack_df, warehouse_mapping):
     warehouse_match_count = 0
     warehouse_missing_count = 0
 
-    print("\nBuilding Full Flow FMS...")
-
-    for _, fms_row in fms_df.iterrows():
-        match_key = fms_row["_MATCH_KEY"]
-
+    for pos, (_, fms_row) in enumerate(fms_df.iterrows()):
         base_row = {
             column: fms_row[column] if column in fms_row.index else ""
             for column in OUTPUT_COLUMNS
         }
+        matched_sales_rows = assigned[pos] if pos < len(assigned) else []
 
-        # --------------------------------------------------------
-        # SALES MATCH FOUND
-        # --------------------------------------------------------
-        if match_key in sales_groups:
-            matched_sales_rows = sales_groups[match_key]
+        if matched_sales_rows:
             matched_fms_count += 1
-
             if len(matched_sales_rows) > 1:
                 expanded_fms_count += 1
-
-            for _, sales_row in matched_sales_rows.iterrows():
+            outputs = []
+            for sales_row in matched_sales_rows:
                 output_row = base_row.copy()
 
                 # Order Enquiry -> Full Flow mappings
@@ -1292,52 +1258,26 @@ def build_full_flow(fms_df, sales_df, pick_pack_df, warehouse_mapping):
                 output_row["Invoice Amount"] = sales_row["Total"]     # AY
                 # Order Quantity (J) is deliberately left as the FMS source value.
 
-                # Order Enquiry -> warehouse and dispatched quantity mappings.
                 warehouse_code = sales_row["Originating warehouse"]
                 warehouse_key = normalize_value(warehouse_code)
                 if warehouse_key and warehouse_key in warehouse_mapping:
                     output_row["Warehouse"] = warehouse_mapping[warehouse_key]
                     warehouse_match_count += 1
                 elif warehouse_key:
-                    # Keep the source code as a diagnostic fallback if no mapping
-                    # exists. The run summary reports these unmapped codes.
                     output_row["Warehouse"] = str(warehouse_code).strip()
                     warehouse_missing_count += 1
 
-                dispatched_qty = sales_row["Pick Qty"]
-                if pd.notna(dispatched_qty):
+                # Pick Qty 0 = not picked yet: leave AS blank so a later night can
+                # fill the real quantity (the fill never overwrites a non-blank 0).
+                dispatched_qty = _dispatched_qty(sales_row)
+                if dispatched_qty is not None:
                     output_row["Dispatched Qty"] = dispatched_qty
-
-                # Pick Pack bridge
-                fms_order_no_key = normalize_value(output_row["Order No"])
-                if fms_order_no_key and fms_order_no_key in pick_pack_lookup:
-                    pick_pack_match_count += 1
-                    pick_data = pick_pack_lookup[fms_order_no_key]
-
-                    pick_date = pick_data["Pick Date"]
-                    if pick_date is not None and not pd.isna(pick_date):
-                        output_row["Actual.1"] = pd.Timestamp(pick_date).to_pydatetime()
-                        pick_pack_actual_count += 1
-
-                    if (
-                        not value_found(output_row["Warehouse Team"])
-                        and value_found(pick_data["Pick User"])
-                    ):
-                        output_row["Warehouse Team"] = pick_data["Pick User"]
-                        pick_pack_user_count += 1
-
-                full_flow_rows.append(output_row)
-
-        # --------------------------------------------------------
-        # NO SALES MATCH
-        # --------------------------------------------------------
+                outputs.append(output_row)
         else:
             unmatched_fms_count += 1
-            output_row = base_row.copy()
+            outputs = [base_row.copy()]
 
-            # No cancellation logic here.
-            # The unmatched FMS row is simply retained as-is,
-            # then Pick Pack is bridged if an Order No is available.
+        for output_row in outputs:
             fms_order_no_key = normalize_value(output_row["Order No"])
             if fms_order_no_key and fms_order_no_key in pick_pack_lookup:
                 pick_pack_match_count += 1
@@ -1354,21 +1294,14 @@ def build_full_flow(fms_df, sales_df, pick_pack_df, warehouse_mapping):
                 ):
                     output_row["Warehouse Team"] = pick_data["Pick User"]
                     pick_pack_user_count += 1
-
             full_flow_rows.append(output_row)
 
     full_flow_df = pd.DataFrame(full_flow_rows, columns=OUTPUT_COLUMNS)
 
-    # Open Qty (AT) = Order Quantity (J) - Dispatched Qty (AS).
-    # The per-row Google Sheets formula is written in write_full_flow().
-    full_flow_df["Open Qty"] = full_flow_df["Open Qty"]
-
-    invoice_amount_mapped = int(sales_df["Total"].notna().sum())
-
     print("\n" + "=" * 80)
-    print("PROCESSING SUMMARY")
+    print("PROCESSING SUMMARY (rows to append)")
     print("=" * 80)
-    print(f"Original FMS rows:             {len(fms_df):,}")
+    print(f"FMS rows to append:            {len(fms_df):,}")
     print(f"FMS rows with Sales match:     {matched_fms_count:,}")
     print(f"FMS rows without Sales match:  {unmatched_fms_count:,}")
     print(f"FMS rows expanded:             {expanded_fms_count:,}")
@@ -1377,24 +1310,62 @@ def build_full_flow(fms_df, sales_df, pick_pack_df, warehouse_mapping):
     print(f"Pick Dates -> Actual.1 (X):    {pick_pack_actual_count:,}")
     print(f"Pick Users -> Warehouse Team (V): {pick_pack_user_count:,}")
     print(f"Warehouse codes mapped -> AX:  {warehouse_match_count:,}")
-    print(f"Invoice Amounts mapped -> AY:  {invoice_amount_mapped:,}")
     print(f"Warehouse codes unmapped:      {warehouse_missing_count:,}")
 
     return full_flow_df
 
 
 # ============================================================
-# BACKFILL EXISTING ROWS (blank Order No)
+# NIGHTLY SYNC: suffix-tolerant matching, fill + refresh, new lines
 # ============================================================
-# Why: processing is incremental — a GT is appended once and never revisited. GTs
-# appended before their Vinculum order existed kept a blank Order No (P) forever, so
-# P/Q/S/AS/AW/AX/AY (and, downstream, the GT+Order POD match) stayed empty.
-# Sep-2026: 40 of 1,315 rows had an Order No. This fills ONLY blank cells of existing
-# rows, with the same GT + Vinculum SKU match as build_full_flow, every night.
+# History:
+#  - 2026-10-05: backfill of rows with a BLANK Order No (exact GT + SKU match).
+#  - 2026-10-09: "a lot of rows are empty". Three gaps closed here:
+#      1. Match key was the exact GT Number. FMS "GT Number" is the order's GT Final,
+#         which carries an R/T/F approval suffix on mixed orders (GT081026A1R / …T / …F,
+#         GeneralTrade_FMS Order_Entry.js needsSuffix); Ops punch ExtOrderNo with or
+#         without it. Every old v2 script stripped it on BOTH sides
+#         (GT_FMS_v2_DEPRECATED/orderidandteam.js normalizeOrderId) and pod.py does too.
+#         Now: exact GT first, then GT with ONE trailing R/T/F stripped (both sides),
+#         then the alternate SKU fields (FMS SKU Code / Vinculum Bundle SKU Code) —
+#         always within the SAME GT base, never by prefix (GT…A1 never meets GT…A10).
+#      2. Only rows with a blank Order No were ever revisited, so pick qty / invoice no /
+#         invoice amount that reach Vinculum after the punch never landed. Now every
+#         row whose Order No matches a Vinculum line gets its BLANK cells of
+#         P/Q/S/AS/AW/AX/AY/X/V filled every night (never overwritten).
+#      3. Processing was append-only per GT, so a new SKU line for a GT already in
+#         Full Flow never arrived. Now any FMS GT+SKU not yet in Full Flow is appended.
+#    Cancelled / Virtual Invoice / OOS rows are never written.
 #
-# BACKFILL_MODE env: "dry-run" (count + log, write nothing), "write", "off".
+# BACKFILL_MODE env: "write" (default in CI), "dry-run" (log only, this script writes
+# NOTHING — no fills, no appends), "off" (no fills; appends as before).
 
 BACKFILL_MODE = os.environ.get("BACKFILL_MODE", "dry-run").strip().lower()
+
+# Safety net for gap 3: if this many FMS lines suddenly look "missing" from GTs that
+# are already in Full Flow, something structural changed (e.g. SKU codes rewritten);
+# refuse to append them and say so, rather than duplicate hundreds of rows.
+NEW_LINES_FOR_EXISTING_GTS_MAX = 300
+
+# Values that mark a line as closed by a human / earlier job. Such rows are never written.
+CLOSED_MARKERS = {"cancelled", "virtual invoice", "out of stock", "oos"}
+
+# Output columns in which a closed marker is looked for: J (Order Quantity) and P:AW.
+_P_INDEX = OUTPUT_COLUMNS.index("Order No")
+_AW_INDEX = OUTPUT_COLUMNS.index("Invoice No")
+CLOSED_MARKER_COLUMNS = ["Order Quantity"] + OUTPUT_COLUMNS[_P_INDEX:_AW_INDEX + 1]
+
+
+def _dispatched_qty(sale):
+    """Vinculum Pick Qty as Dispatched Qty, or None when not picked yet (blank / 0)."""
+    qty = sale["Pick Qty"]
+    try:
+        if pd.isna(qty) or float(qty) <= 0:
+            return None
+    except (TypeError, ValueError):
+        return None
+    return qty
+
 
 # Output column <- how to get the value from a matched Order Enquiry row.
 BACKFILL_FIELDS = [
@@ -1405,77 +1376,444 @@ BACKFILL_FIELDS = [
     ("Invoice Amount", lambda s, wh: s["Total"]),                 # AY
     ("Warehouse", lambda s, wh: wh.get(normalize_value(s["Originating warehouse"]),
                                        str(s["Originating warehouse"]).strip())),  # AX
-    ("Dispatched Qty", lambda s, wh: s["Pick Qty"]),              # AS
+    ("Dispatched Qty", lambda s, wh: _dispatched_qty(s)),         # AS
 ]
 
 
-def _is_cancelled_row(row):
-    return any(
-        str(row.get(c, "")).strip().lower() == "cancelled"
-        for c in ("Order No", "Order Quantity", "Status", "Dispatched Qty")
-    )
+_GT_APPROVAL_SUFFIX = re.compile(r"(?<=\d)[RTF]$")
 
 
-def plan_backfill(existing_df, sales_groups, pick_pack_lookup, warehouse_mapping):
-    """Return (writes, stats). writes = [(sheet_row, output_column, value)].
+def gt_base(value):
+    """GT081026A1R / GT081026A1T / GT081026A1F -> GT081026A1.
 
-    existing_df row i is sheet row 8 + i (read from A8 with every row padded, so no
-    rows are dropped). Only blank cells of rows with a blank Order No are written.
+    Strips exactly ONE trailing R/T/F that follows a digit (GT bases are
+    "GT" + ddmmyy + "A" + serial, always ending in a digit). Comparison is by
+    equality only, so GT081026A1 and GT081026A10 can never be confused.
     """
-    stats = {"rows_considered": 0, "rows_filled": 0, "rows_still_unmatched": 0,
-             "cells": 0, "unplaced_sales_lines": 0, "unplaced_keys": []}
+    return _GT_APPROVAL_SUFFIX.sub("", normalize_value(value))
+
+
+def row_is_closed(row):
+    """True when a human or an earlier job closed this line (Cancelled / Virtual
+    Invoice / OOS in J or anywhere in P:AW). Such rows are never written."""
+    for column in CLOSED_MARKER_COLUMNS:
+        try:
+            value = row[column]
+        except (KeyError, IndexError):
+            continue
+        if str(value if value is not None else "").strip().lower() in CLOSED_MARKERS:
+            return True
+    return False
+
+
+# Kept for callers/tests of the 2026-10-05 version.
+def _is_cancelled_row(row):
+    return row_is_closed(row)
+
+
+def _row_marker(row):
+    for column in CLOSED_MARKER_COLUMNS:
+        value = str(row.get(column, "") if hasattr(row, "get") else "").strip().lower()
+        if value in CLOSED_MARKERS:
+            return value
+    return ""
+
+
+def prepare_sales_lines(sales_df):
+    """Parse Order Enquiry (build_sales_lookup), add GT/SKU keys, drop lines that are
+    duplicated across month tabs. Returns a DataFrame indexed 0..n-1 (line id)."""
+    _, sales_df = build_sales_lookup(sales_df)
+    sales_df = sales_df.reset_index(drop=True)
+
+    sales_df["_GT"] = sales_df["ExtOrderNo"].map(normalize_value)
+    sales_df["_GT_BASE"] = sales_df["ExtOrderNo"].map(gt_base)
+    sales_df["_SKU"] = sales_df["SKU Code"].map(normalize_value)
+    if "Bundle SKU Code" in sales_df.columns:
+        sales_df["_SKU_ALT"] = sales_df["Bundle SKU Code"].map(normalize_value)
+    else:
+        sales_df["_SKU_ALT"] = ""
+    sales_df["_ORDER"] = sales_df["Order No"].map(normalize_value)
+
+    before = len(sales_df)
+    if "_TAB" in sales_df.columns and before:
+        # The same Vinculum line exported into two month tabs (e.g. "Sep-26" and
+        # "Sept-26") would otherwise count as a second shipment. Same-tab repeats are
+        # kept (they can be genuine separate lines). Keep the most complete copy.
+        sales_df["_COMPLETE"] = (
+            sales_df["Invoice No"].map(value_found).astype(int) * 2
+            + sales_df["Pick Qty"].fillna(0).gt(0).astype(int)
+        )
+        key_cols = ["_ORDER", "_GT", "_SKU"]
+        ranked = sales_df.sort_values("_COMPLETE", ascending=False, kind="stable")
+        tabs_per_key = ranked.groupby(key_cols)["_TAB"].transform("nunique")
+        first_tab = ranked.groupby(key_cols)["_TAB"].transform("first")
+        keep = (tabs_per_key <= 1) | (ranked["_TAB"] == first_tab)
+        sales_df = ranked[keep].sort_index().drop(columns=["_COMPLETE"])
+        sales_df = sales_df.reset_index(drop=True)
+    print(f"Order Enquiry lines: {before:,} -> {len(sales_df):,} after dropping "
+          f"cross-tab duplicates ({before - len(sales_df):,} dropped)")
+    return sales_df
+
+
+class _Slot:
+    """One Full Flow row (existing) or FMS row (to be appended) taking part in matching."""
+    __slots__ = ("kind", "ref", "gt", "base", "sku", "sku_alt", "order", "closed",
+                 "anchor", "assigned", "tier")
+
+    def __init__(self, kind, ref, row):
+        self.kind = kind
+        self.ref = ref
+        self.gt = normalize_value(row["GT Number"])
+        self.base = gt_base(row["GT Number"])
+        self.sku = normalize_value(row["Vinculum SKU"])
+        self.sku_alt = normalize_value(row["SKU Code"]) if "SKU Code" in row.index else ""
+        order = normalize_value(row["Order No"]) if "Order No" in row.index else ""
+        self.order = "" if order.lower() in CLOSED_MARKERS else order
+        self.closed = row_is_closed(row)
+        self.anchor = None      # line id already recorded in P (refresh source)
+        self.assigned = []      # line ids given to a blank row / new row
+        self.tier = None
+
+
+def _match_tier(slot, line):
+    """1 = exact GT + Vinculum SKU, 2 = same GT base (R/T/F stripped) + Vinculum SKU,
+    3 = same GT base + alternate SKU field (FMS SKU Code / Vinculum Bundle SKU Code).
+    None = no match. Caller only compares lines of the same GT base."""
+    if slot.base == "" or slot.base != line["_GT_BASE"]:
+        return None
+    if slot.sku and slot.sku == line["_SKU"]:
+        return 1 if slot.gt == line["_GT"] else 2
+    slot_skus = {s for s in (slot.sku, slot.sku_alt) if s}
+    line_skus = {s for s in (line["_SKU"], line["_SKU_ALT"]) if s}
+    if slot_skus & line_skus:
+        return 3
+    return None
+
+
+def allocate_lines(slots, lines):
+    """Give each Vinculum line to at most one slot.
+
+    1. Anchor: a row whose Order No (P) is already filled keeps the line with that
+       Order No (best tier) — that line is the source for refreshing its blank cells.
+    2. Fill: rows with a blank P (existing rows first, then rows being appended), tier
+       by tier, take the first unused matching line.
+    3. Expand: leftover tier-1/2 lines of a GT+SKU that is being appended go to the
+       last appended row of that key (one output row per line, as before).
+    Leftover matching lines are returned as unplaced (reported, not inserted).
+    """
+    lines_by_base = {}
+    for line_id, base in lines["_GT_BASE"].items():
+        if base:
+            lines_by_base.setdefault(base, []).append(line_id)
+    records = lines[["_GT", "_GT_BASE", "_SKU", "_SKU_ALT", "_ORDER"]].to_dict("index")
+
+    slots_by_base = {}
+    for slot in slots:
+        if slot.base:
+            slots_by_base.setdefault(slot.base, []).append(slot)
+
+    unplaced = []
+    for base, group in slots_by_base.items():
+        line_ids = lines_by_base.get(base, [])
+        if not line_ids:
+            continue
+        used = set()
+
+        for slot in group:
+            if not slot.order:
+                continue
+            best = None
+            for lid in line_ids:
+                if lid in used or records[lid]["_ORDER"] != slot.order:
+                    continue
+                tier = _match_tier(slot, records[lid])
+                if tier is not None and (best is None or tier < best[0]):
+                    best = (tier, lid)
+            if best:
+                slot.anchor, slot.tier = best[1], best[0]
+                used.add(best[1])
+
+        open_slots = [s for s in group if not s.order and not s.closed and s.kind == "existing"]
+        open_slots += [s for s in group if s.kind == "new"]
+        for tier_limit in (1, 2, 3):
+            for slot in open_slots:
+                if slot.assigned:
+                    continue
+                for lid in line_ids:
+                    if lid in used:
+                        continue
+                    tier = _match_tier(slot, records[lid])
+                    if tier is not None and tier <= tier_limit:
+                        slot.assigned.append(lid)
+                        slot.tier = tier
+                        used.add(lid)
+                        break
+
+        new_slots = [s for s in group if s.kind == "new"]
+        for lid in line_ids:
+            if lid in used:
+                continue
+            takers = [s for s in new_slots
+                      if (_match_tier(s, records[lid]) or 9) <= 2]
+            if takers:
+                takers[-1].assigned.append(lid)
+                used.add(lid)
+                continue
+            if any(_match_tier(s, records[lid]) is not None for s in group if not s.closed):
+                unplaced.append(lid)
+    return unplaced
+
+
+def plan_existing_writes(existing_df, slots, lines, pick_pack_lookup, warehouse_mapping):
+    """Cell writes for existing rows: blank cells only, never a closed row.
+    Returns (writes, stats); writes = [(sheet_row, output_column, value, reason)]."""
+    stats = {"blank_p_rows": 0, "filled_rows": 0, "fill_cells": 0,
+             "still_unmatched": 0, "refreshed_rows": 0, "refresh_cells": 0,
+             "tiers": {1: 0, 2: 0, 3: 0}, "anchored_rows": 0,
+             "stale_zero_dispatched": 0, "order_no_without_line": 0}
     writes = []
-
-    by_key = {}
-    for i, row in existing_df.iterrows():
-        key = create_match_key(row["GT Number"], row["Vinculum SKU"])
-        if key != "||":
-            by_key.setdefault(key, []).append((i, row))
-
-    for key, rows in by_key.items():
-        blank_rows = [(i, r) for i, r in rows
-                      if not value_found(r["Order No"]) and not _is_cancelled_row(r)]
-        if not blank_rows:
+    for slot in slots:
+        if slot.kind != "existing" or slot.closed:
             continue
-        stats["rows_considered"] += len(blank_rows)
-
-        if key not in sales_groups:
-            stats["rows_still_unmatched"] += len(blank_rows)
+        i = slot.ref
+        row = existing_df.loc[i]
+        if not slot.order:
+            stats["blank_p_rows"] += 1
+            if not slot.assigned:
+                stats["still_unmatched"] += 1
+                continue
+            line_id, reason = slot.assigned[0], "fill"
+            stats["tiers"][slot.tier] += 1
+        elif slot.anchor is not None:
+            line_id, reason = slot.anchor, "refresh"
+            stats["anchored_rows"] += 1
+        else:
+            stats["order_no_without_line"] += 1
             continue
 
-        used = {normalize_value(r["Order No"]) for _, r in rows if value_found(r["Order No"])}
-        candidates = [s for _, s in sales_groups[key].iterrows()
-                      if normalize_value(s["Order No"]) not in used]
+        sale = lines.loc[line_id]
+        sheet_row = 8 + int(i)
+        row_cells = []
+        for column, getter in BACKFILL_FIELDS:
+            value = getter(sale, warehouse_mapping)
+            if value is not None and value_found(value) and not value_found(row[column]):
+                row_cells.append((sheet_row, column, value, reason))
 
-        if len(candidates) > len(blank_rows):
-            stats["unplaced_sales_lines"] += len(candidates) - len(blank_rows)
-            stats["unplaced_keys"].append(key)
-        if len(candidates) < len(blank_rows):
-            stats["rows_still_unmatched"] += len(blank_rows) - len(candidates)
+        pick = pick_pack_lookup.get(normalize_value(sale["Order No"]))
+        if pick:
+            if pick["Pick Date"] is not None and not pd.isna(pick["Pick Date"]) \
+                    and not value_found(row["Actual.1"]):
+                row_cells.append((sheet_row, "Actual.1",
+                                  pd.Timestamp(pick["Pick Date"]).to_pydatetime(), reason))
+            if value_found(pick["Pick User"]) and not value_found(row["Warehouse Team"]):
+                row_cells.append((sheet_row, "Warehouse Team", pick["Pick User"], reason))
 
-        for (i, row), sale in zip(blank_rows, candidates):
-            sheet_row = 8 + int(i)
-            row_cells = []
-            for column, getter in BACKFILL_FIELDS:
-                value = getter(sale, warehouse_mapping)
-                if value_found(value) and not value_found(row[column]):
-                    row_cells.append((sheet_row, column, value))
+        current_as = row["Dispatched Qty"]
+        try:
+            if value_found(current_as) and float(current_as) == 0 \
+                    and _dispatched_qty(sale) is not None:
+                stats["stale_zero_dispatched"] += 1
+        except (TypeError, ValueError):
+            pass
 
-            pick = pick_pack_lookup.get(normalize_value(sale["Order No"]))
-            if pick:
-                if pick["Pick Date"] is not None and not pd.isna(pick["Pick Date"]) \
-                        and not value_found(row["Actual.1"]):
-                    row_cells.append((sheet_row, "Actual.1",
-                                      pd.Timestamp(pick["Pick Date"]).to_pydatetime()))
-                if value_found(pick["Pick User"]) and not value_found(row["Warehouse Team"]):
-                    row_cells.append((sheet_row, "Warehouse Team", pick["Pick User"]))
-
-            if row_cells:
-                stats["rows_filled"] += 1
-                stats["cells"] += len(row_cells)
-                writes.extend(row_cells)
-
+        if row_cells:
+            if reason == "fill":
+                stats["filled_rows"] += 1
+                stats["fill_cells"] += len(row_cells)
+            else:
+                stats["refreshed_rows"] += 1
+                stats["refresh_cells"] += len(row_cells)
+            writes.extend(row_cells)
     return writes, stats
+
+
+def plan_backfill(existing_df, sales_lines, pick_pack_lookup, warehouse_mapping):
+    """Existing rows only (no appends). Kept as the single entry point the tests use.
+    Returns (writes, stats, slots, unplaced)."""
+    slots = [_Slot("existing", i, row) for i, row in existing_df.iterrows()]
+    unplaced = allocate_lines(slots, sales_lines)
+    writes, stats = plan_existing_writes(existing_df, slots, sales_lines,
+                                         pick_pack_lookup, warehouse_mapping)
+    stats["unplaced_sales_lines"] = len(unplaced)
+    return writes, stats, slots, unplaced
+
+
+def find_new_fms_rows(fms_df, existing_df):
+    """FMS rows whose GT Number + Vinculum SKU is not in Full Flow yet.
+
+    Returns (new_gt_mask, new_line_mask): rows of GTs Full Flow has never seen, and
+    rows of GTs it has but whose SKU line is missing (gap 3). Exact normalised keys:
+    a line already in Full Flow in any state (incl. Cancelled) is never re-added.
+    """
+    ff_gts = set(existing_df["GT Number"].map(normalize_value)) - {""}
+    ff_keys = set(
+        create_match_key(gt, sku)
+        for gt, sku in zip(existing_df["GT Number"], existing_df["Vinculum SKU"])
+    )
+    gts = fms_df["GT Number"].map(normalize_value)
+    keys = pd.Series(
+        [create_match_key(gt, sku) for gt, sku in zip(fms_df["GT Number"], fms_df["Vinculum SKU"])],
+        index=fms_df.index,
+    )
+    has_gt = gts != ""
+    new_gt_mask = has_gt & ~gts.isin(ff_gts)
+    new_line_mask = has_gt & gts.isin(ff_gts) & ~keys.isin(ff_keys)
+    return new_gt_mask, new_line_mask
+
+
+def report_suspect_cancellations(existing_df, sales_lines, path=None):
+    """READ-ONLY. Full Flow rows that read "Cancelled" but DO have a Vinculum line under
+    the suffix-tolerant rule — likely fabricated by the historical-cancellation logic
+    (no match -> "Cancelled"). Nothing is reverted; the CSV is for a human decision."""
+    probe = []
+    for i, row in existing_df.iterrows():
+        if _row_marker(row) != "cancelled":
+            continue
+        slot = _Slot("existing", i, row)
+        slot.order = ""
+        probe.append((i, row, slot))
+
+    by_base = {}
+    for line_id, base in sales_lines["_GT_BASE"].items():
+        if base:
+            by_base.setdefault(base, []).append(line_id)
+    records = sales_lines[["_GT", "_GT_BASE", "_SKU", "_SKU_ALT", "_ORDER"]].to_dict("index")
+
+    rows = []
+    for i, row, slot in probe:
+        hits = [lid for lid in by_base.get(slot.base, [])
+                if _match_tier(slot, records[lid]) is not None]
+        if not hits:
+            continue
+        p_value = str(row["Order No"]).strip().lower()
+        pattern = ("dashboard/manual cancel (P:AW)" if p_value == "cancelled"
+                   else "historical auto-cancel (T:AW, P blank)")
+        matched = sales_lines.loc[hits]
+        invoices = [str(v) for v in matched["Invoice No"] if value_found(v)]
+        rows.append({
+            "sheet_row": 8 + int(i),
+            "gt_number": row["GT Number"],
+            "vinculum_sku": row["Vinculum SKU"],
+            "form_received": row["Form Received Time"],
+            "pattern": pattern,
+            "vinculum_order_nos": ", ".join(dict.fromkeys(str(v) for v in matched["Order No"])),
+            "vinculum_ext_order_nos": ", ".join(dict.fromkeys(str(v) for v in matched["ExtOrderNo"])),
+            "vinculum_invoice_nos": ", ".join(dict.fromkeys(invoices)),
+            "invoiced": "yes" if invoices else "no",
+        })
+    report = pd.DataFrame(rows, columns=[
+        "sheet_row", "gt_number", "vinculum_sku", "form_received", "pattern",
+        "vinculum_order_nos", "vinculum_ext_order_nos", "vinculum_invoice_nos", "invoiced"])
+
+    print("\n" + "=" * 80)
+    print("REPORT: 'Cancelled' rows that DO have a Vinculum line (read-only, nothing reverted)")
+    print("=" * 80)
+    print(f"Rows reading Cancelled:                 {len(probe):,}")
+    print(f"... of which have a Vinculum match:     {len(report):,}")
+    if len(report):
+        for pattern, count in report["pattern"].value_counts().items():
+            print(f"  {pattern:<42} {count:,}")
+        print(f"  invoiced in Vinculum:                 {(report['invoiced'] == 'yes').sum():,}")
+        for _, r in report.head(25).iterrows():
+            print(f"  row {r['sheet_row']}: {r['gt_number']} / {r['vinculum_sku']} -> "
+                  f"{r['vinculum_order_nos']} (ext {r['vinculum_ext_order_nos']}; "
+                  f"inv {r['vinculum_invoice_nos'] or '-'}) [{r['pattern']}]")
+    if path:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        report.to_csv(path, index=False)
+        print(f"Full list written to {path} (workflow artifact 'fullflow-reports').")
+    return report
+
+
+def _print_unmatched_diagnostics(existing_df, slots, sales_lines, limit=15, path=None):
+    """READ-ONLY. For blank-P rows that still have no line: is the GT base in Vinculum
+    at all, which SKUs does Vinculum hold for it, and which ExtOrderNos merely CONTAIN
+    the GT base (formatting variants). Writes a CSV for offline analysis."""
+    bases = set(sales_lines["_GT_BASE"]) - {""}
+    lines_by_base = {}
+    for lid, base in sales_lines["_GT_BASE"].items():
+        if base:
+            lines_by_base.setdefault(base, []).append(lid)
+    used = set()
+    for slot in slots:
+        if slot.anchor is not None:
+            used.add(slot.anchor)
+        used.update(slot.assigned)
+    unique_ext = sorted(set(sales_lines["_GT"]) - {""})
+    print("Order Enquiry columns: " + " | ".join(str(c) for c in sales_lines.columns
+                                                  if not str(c).startswith("_")))
+    gt_absent = gt_present = 0
+    samples, rows = [], []
+    for slot in slots:
+        if slot.kind != "existing" or slot.closed or slot.order or slot.assigned:
+            continue
+        row = existing_df.loc[slot.ref]
+        if slot.base in bases:
+            gt_present += 1
+            reason = "sku_differs"
+            lids = lines_by_base[slot.base]
+            vin = [f"{sales_lines.at[l, '_SKU']}={sales_lines.at[l, '_ORDER']}"
+                   f"{'*' if l in used else ''}" for l in lids]
+            near = []
+            if len(samples) < limit:
+                samples.append(f"  SKU differs: row {8 + int(slot.ref)} {slot.gt} / {slot.sku}"
+                               f" (alt {slot.sku_alt or '-'}) ; Vinculum has "
+                               + ", ".join(vin[:8]))
+        else:
+            gt_absent += 1
+            reason = "gt_not_in_vinculum"
+            vin = []
+            near = [e for e in unique_ext
+                    if slot.base and slot.base in e and e != slot.base
+                    and not re.match(r"\d", e[e.index(slot.base) + len(slot.base):][:1] or "x")][:5]
+        rows.append({
+            "sheet_row": 8 + int(slot.ref), "gt_number": slot.gt, "gt_base": slot.base,
+            "vinculum_sku": slot.sku, "sku_code": slot.sku_alt,
+            "form_received": row["Form Received Time"], "party": row.get("Party Name", ""),
+            "reason": reason, "vinculum_lines_for_gt (*=used)": " ".join(vin),
+            "ext_order_nos_containing_gt": " ".join(near),
+        })
+    print(f"Still unmatched, GT base NOT in Vinculum (not punched yet): {gt_absent:,}")
+    print(f"Still unmatched, GT base in Vinculum but no SKU match:      {gt_present:,}")
+    near_count = sum(1 for r in rows if r["ext_order_nos_containing_gt"])
+    print(f"  ... GT not in Vinculum but an ExtOrderNo CONTAINS it:     {near_count:,}")
+    for s in samples:
+        print(s)
+    if path:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        pd.DataFrame(rows).to_csv(path, index=False)
+        print(f"Unmatched rows written to {path} (workflow artifact 'fullflow-reports').")
+        # Vinculum GT-looking orders since Aug whose GT base is on NO Full Flow row:
+        # if ExtOrderNo formatting drifted, the "not in Vinculum" GTs show up here.
+        ff_bases = {s.base for s in slots}
+        recent = sales_lines["Order Date"].ge(pd.Timestamp("2026-08-01"))
+        unclaimed = sales_lines[recent & ~sales_lines["_GT_BASE"].isin(ff_bases)]
+        unclaimed = unclaimed[["ExtOrderNo", "Order No", "SKU Code", "Order Date", "Created by"]]
+        unclaimed_path = os.path.join(os.path.dirname(path), "vinculum_lines_not_in_full_flow.csv")
+        unclaimed.to_csv(unclaimed_path, index=False)
+        print(f"Vinculum lines since Aug with a GT base on no Full Flow row: {len(unclaimed):,} "
+              f"-> {unclaimed_path}")
+
+
+FILL_RATE_COLUMNS = ["Order No", "Team", "Actual", "Warehouse Team", "Actual.1",
+                     "Order Delivery Status", "Dispatched Qty", "POD Copy",
+                     "Delivered Date", "Invoice No", "Warehouse", "Invoice Amount"]
+
+
+def _print_fill_rates(existing_df):
+    """READ-ONLY. Filled cells per column and form month on open (not closed) rows."""
+    closed = existing_df.apply(row_is_closed, axis=1)
+    open_rows = existing_df[~closed]
+    months = open_rows["Form Received Time"].map(_month_of)
+    print("\nFill rate on open rows (filled / rows) by form month; closed rows: "
+          f"{int(closed.sum()):,}")
+    header = f"{'month':<8}{'rows':>6} " + " ".join(f"{backfill_a1(8, c).split('!')[1][:-1]:>5}"
+                                                  for c in FILL_RATE_COLUMNS)
+    print(header)
+    for month in sorted(months.unique()):
+        part = open_rows[months == month]
+        counts = [int(part[c].map(value_found).sum()) for c in FILL_RATE_COLUMNS]
+        print(f"{month:<8}{len(part):>6} " + " ".join(f"{n:>5}" for n in counts))
 
 
 def backfill_a1(sheet_row, column):
@@ -1486,51 +1824,21 @@ def backfill_a1(sheet_row, column):
     return f"'{FULL_FLOW_SHEET_NAME}'!{letters}{sheet_row}"
 
 
-def run_backfill(existing_df, sales_df, pick_pack_df, warehouse_mapping):
-    print("\n" + "=" * 80)
-    print(f"BACKFILL EXISTING ROWS (blank Order No)  —  mode: {BACKFILL_MODE}")
-    print("=" * 80)
-    if BACKFILL_MODE == "off":
-        print("Backfill disabled.")
-        return
-
-    # Work on copies: build_full_flow parses these frames again later.
-    sales_groups, _ = build_sales_lookup(sales_df.copy())
-    try:
-        pick_pack_lookup = build_pick_pack_lookup(pick_pack_df.copy())
-    except SystemExit:
-        pick_pack_lookup = {}
-
-    writes, stats = plan_backfill(existing_df, sales_groups, pick_pack_lookup, warehouse_mapping)
-
-    print(f"Rows with blank Order No considered: {stats['rows_considered']:,}")
-    print(f"Rows that would be / are filled:     {stats['rows_filled']:,}")
-    print(f"Cells that would be / are written:   {stats['cells']:,}")
-    print(f"Rows still without a Vinculum match: {stats['rows_still_unmatched']:,}")
-    print(f"Extra Vinculum lines not placed:     {stats['unplaced_sales_lines']:,} "
-          f"(GT+SKU keys: {len(stats['unplaced_keys']):,})")
-    for key in stats["unplaced_keys"][:20]:
-        print(f"  unplaced: {key}")
-    per_col = {}
-    for _, column, _ in writes:
-        per_col[column] = per_col.get(column, 0) + 1
-    for column, count in per_col.items():
-        print(f"  {column:<16} {count:,}")
-    for sheet_row, column, value in writes[:15]:
-        print(f"  sample: row {sheet_row} {column} = {clean_for_google(value)!r}")
-
-    if BACKFILL_MODE != "write" or not writes:
-        print("DRY RUN — nothing written." if BACKFILL_MODE != "write" else "Nothing to write.")
-        return
-
-    data = [{"range": backfill_a1(r, c), "values": [[clean_for_google(v)]]} for r, c, v in writes]
+def write_cells(writes):
+    data = [{"range": backfill_a1(r, c), "values": [[clean_for_google(v)]]}
+            for r, c, v, _ in writes]
     for start in range(0, len(data), 500):
         sheets_service.spreadsheets().values().batchUpdate(
             spreadsheetId=OUTPUT_SPREADSHEET_ID,
             body={"valueInputOption": "USER_ENTERED", "data": data[start:start + 500]},
         ).execute()
         print(f"  Written cells {start + 1:,} - {min(start + 500, len(data)):,}")
-    print(f"Backfill complete: {len(data):,} cells written.")
+    print(f"Fill/refresh complete: {len(data):,} cells written.")
+
+
+def _month_of(value):
+    ts = pd.to_datetime(value, errors="coerce", dayfirst=True)
+    return "unknown" if pd.isna(ts) else ts.strftime("%Y-%m")
 
 
 # ============================================================
@@ -1548,6 +1856,10 @@ def main():
     print(f"Order Enquiry Spreadsheet:  {ORDER_ENQUIRY_SPREADSHEET_ID}")
     print(f"Order Enquiry tabs config:  {ORDER_ENQUIRY_SHEET_NAMES if ORDER_ENQUIRY_SHEET_NAMES else 'ALL TABS'}")
     print(f"Pick Pack folder ID:        {PICK_PACK_FOLDER_ID}")
+    print(f"Mode (BACKFILL_MODE):       {BACKFILL_MODE}")
+    if BACKFILL_MODE not in ("write", "dry-run", "off"):
+        raise SystemExit(f"Unknown BACKFILL_MODE {BACKFILL_MODE!r} (write / dry-run / off)")
+    dry_run = BACKFILL_MODE == "dry-run"
 
     # --------------------------------------------------------
     # READ SOURCE DATA
@@ -1557,85 +1869,136 @@ def main():
     pick_pack_df = read_pick_pack_files()
     warehouse_mapping = read_warehouse_mapping()
 
-    # --------------------------------------------------------
-    # OPTIONAL HISTORICAL CANCELLATION
-    # --------------------------------------------------------
-    fms_df = apply_historical_cancellation(
-        fms_df,
-        sales_df,
-    )
+    # Disabled since 2026-10-09 (ENABLE_HISTORICAL_CANCELLATION = "NO"); kept so the
+    # switch still works. It only ever affected rows being appended.
+    fms_df = apply_historical_cancellation(fms_df, sales_df)
 
-    # --------------------------------------------------------
-    # INCREMENTAL PROCESSING
-    # --------------------------------------------------------
-    # Do NOT clear the destination. Existing processed GTs must keep
-    # their current points/statuses/actuals. Only new GTs are processed.
     output_sheet_id = get_output_sheet()
     existing_full_flow_df = read_existing_full_flow()
-    processed_gt_numbers = get_processed_gt_numbers(existing_full_flow_df)
 
-    # Fill blank Order No (and dependent fields) on rows already in Full Flow.
-    # Runs every night, before the "no new GTs" early exit below.
-    run_backfill(existing_full_flow_df, sales_df, pick_pack_df, warehouse_mapping)
+    sales_lines = prepare_sales_lines(sales_df.copy())
+    try:
+        pick_pack_lookup = build_pick_pack_lookup(pick_pack_df.copy())
+    except SystemExit:
+        pick_pack_lookup = {}
 
-    fms_to_process = filter_unprocessed_fms(
-        fms_df,
-        processed_gt_numbers,
-    )
+    # --------------------------------------------------------
+    # WHICH FMS ROWS ARE MISSING FROM FULL FLOW
+    # --------------------------------------------------------
+    new_gt_mask, new_line_mask = find_new_fms_rows(fms_df, existing_full_flow_df)
+    print("\n" + "=" * 80)
+    print("FMS ROWS NOT YET IN FULL FLOW")
+    print("=" * 80)
+    print(f"Rows of GTs not in Full Flow (new GTs):              {int(new_gt_mask.sum()):,}")
+    print(f"New SKU lines for GTs already in Full Flow:          {int(new_line_mask.sum()):,}")
+    if new_line_mask.any():
+        months = fms_df.loc[new_line_mask, "Form Received Time"].map(_month_of).value_counts().sort_index()
+        print("  by form month: " + ", ".join(f"{m} {c}" for m, c in months.items()))
+        for _, r in fms_df.loc[new_line_mask].head(15).iterrows():
+            print(f"  new line: {r['GT Number']} / {r['Vinculum SKU']} qty {r['Order Quantity']}"
+                  f" ({r['Form Received Time']})")
+    if int(new_line_mask.sum()) > NEW_LINES_FOR_EXISTING_GTS_MAX:
+        print(f"WARNING: more than {NEW_LINES_FOR_EXISTING_GTS_MAX} new lines for existing GTs — "
+              f"NOT appending them (looks structural, check the samples above). New GTs still go in.")
+        new_line_mask[:] = False
+    fms_to_append = fms_df.loc[new_gt_mask | new_line_mask].copy()
 
-    if fms_to_process.empty:
-        print("\nNo new GTs to process.")
-        print("Existing Full Flow FMS data has been left completely unchanged.")
+    # --------------------------------------------------------
+    # MATCH (existing rows + rows to append) AGAINST VINCULUM
+    # --------------------------------------------------------
+    slots = [_Slot("existing", i, row) for i, row in existing_full_flow_df.iterrows()]
+    new_slots = [_Slot("new", pos, row)
+                 for pos, (_, row) in enumerate(fms_to_append.iterrows())]
+    unplaced = allocate_lines(slots + new_slots, sales_lines)
+
+    writes, stats = plan_existing_writes(existing_full_flow_df, slots, sales_lines,
+                                         pick_pack_lookup, warehouse_mapping)
+
+    print("\n" + "=" * 80)
+    print(f"FILL + REFRESH EXISTING ROWS  —  mode: {BACKFILL_MODE}")
+    print("=" * 80)
+    closed_rows = sum(1 for s in slots if s.closed)
+    print(f"Existing rows:                                {len(slots):,}")
+    print(f"Closed rows skipped (Cancelled/Virtual/OOS):  {closed_rows:,}")
+    print(f"Rows with blank Order No considered:          {stats['blank_p_rows']:,}")
+    print(f"  matched now (would be / are filled):        {stats['filled_rows']:,}  "
+          f"(tier1 exact {stats['tiers'][1]:,} | tier2 R/T/F suffix {stats['tiers'][2]:,} | "
+          f"tier3 alt SKU {stats['tiers'][3]:,})")
+    print(f"  cells:                                      {stats['fill_cells']:,}")
+    print(f"Rows still without a Vinculum match:          {stats['still_unmatched']:,}")
+    print(f"Rows with Order No anchored to a Vinculum line: {stats['anchored_rows']:,}")
+    print(f"  of which get blank cells refreshed:         {stats['refreshed_rows']:,}")
+    print(f"  refresh cells:                              {stats['refresh_cells']:,}")
+    print(f"Rows with an Order No not found in Vinculum (no refresh): {stats['order_no_without_line']:,}")
+    print(f"Rows with Dispatched Qty 0 but Vinculum picked >0 (not overwritten): "
+          f"{stats['stale_zero_dispatched']:,}")
+    print(f"Extra Vinculum lines not placed (split shipments): {len(unplaced):,}")
+    for lid in unplaced[:15]:
+        line = sales_lines.loc[lid]
+        print(f"  unplaced: {line['ExtOrderNo']} / {line['SKU Code']} -> {line['Order No']}")
+    per_col = {}
+    for _, column, _, reason in writes:
+        per_col[(reason, column)] = per_col.get((reason, column), 0) + 1
+    for (reason, column), count in sorted(per_col.items()):
+        print(f"  {reason:<8} {column:<16} {count:,}")
+    for sheet_row, column, value, reason in writes[:10]:
+        print(f"  sample {reason}: row {sheet_row} {column} = {clean_for_google(value)!r}")
+    tier2 = [s for s in slots if s.kind == "existing" and s.assigned and s.tier == 2][:10]
+    for s in tier2:
+        line = sales_lines.loc[s.assigned[0]]
+        print(f"  suffix match: row {8 + int(s.ref)} {s.gt} / {s.sku} <- Vinculum "
+              f"{line['ExtOrderNo']} / {line['SKU Code']} = {line['Order No']}")
+    tier3 = [s for s in slots if s.kind == "existing" and s.assigned and s.tier == 3][:10]
+    for s in tier3:
+        line = sales_lines.loc[s.assigned[0]]
+        print(f"  alt-SKU match: row {8 + int(s.ref)} {s.gt} / {s.sku} (SKU Code {s.sku_alt}) <- "
+              f"Vinculum {line['ExtOrderNo']} / {line['SKU Code']} "
+              f"(bundle {line.get('Bundle SKU Code', '')}) = {line['Order No']}")
+    _print_unmatched_diagnostics(existing_full_flow_df, slots, sales_lines,
+                                 path=os.path.join("reports", "unmatched_rows.csv"))
+
+    _print_fill_rates(existing_full_flow_df)
+
+    report_suspect_cancellations(
+        existing_full_flow_df, sales_lines,
+        path=os.path.join("reports", "suspect_cancellations.csv"))
+
+    # --------------------------------------------------------
+    # BUILD ROWS TO APPEND
+    # --------------------------------------------------------
+    assigned = [[sales_lines.loc[lid] for lid in s.assigned] for s in new_slots]
+    new_full_flow_df = build_full_flow(fms_to_append, assigned, pick_pack_lookup,
+                                       warehouse_mapping) if len(fms_to_append) else \
+        pd.DataFrame(columns=OUTPUT_COLUMNS)
+
+    if dry_run:
+        print("\nDRY RUN — nothing written (no fills, no refresh, no appends).")
+        print(f"Would append {len(new_full_flow_df):,} rows after row "
+              f"{7 + len(existing_full_flow_df):,}.")
+        for _, r in new_full_flow_df.head(15).iterrows():
+            print(f"  would append: {r['GT Number']} / {r['Vinculum SKU']} -> "
+                  f"Order No {clean_for_google(r['Order No']) or '-'}")
         return
 
-    print("\nBuilding Full Flow only for new/unprocessed GTs...")
-    new_full_flow_df = build_full_flow(
-        fms_to_process,
-        sales_df,
-        pick_pack_df,
-        warehouse_mapping,
-    )
+    if BACKFILL_MODE == "write" and writes:
+        write_cells(writes)
+    elif BACKFILL_MODE == "off":
+        print("Fill/refresh disabled (off).")
+
+    if new_full_flow_df.empty:
+        print("\nNothing to append.")
+        return
 
     existing_row_count = len(existing_full_flow_df)
-    write_start_row = 8 + existing_row_count
-
-    write_full_flow(
-        output_sheet_id,
-        new_full_flow_df,
-        start_row=write_start_row,
-    )
-
-    print(
-        f"\nIncremental update complete: "
-        f"{len(new_full_flow_df):,} new rows appended."
-    )
-    print(
-        f"Existing rows preserved: {existing_row_count:,}"
-    )
+    write_full_flow(output_sheet_id, new_full_flow_df, start_row=8 + existing_row_count)
 
     print("\n" + "=" * 80)
     print("COMPLETED SUCCESSFULLY")
     print("=" * 80)
-    print(
-        "Source Spreadsheet: "
-        f"https://docs.google.com/spreadsheets/d/"
-        f"{SOURCE_SPREADSHEET_ID}/edit"
-    )
-    print(
-        "Destination Spreadsheet: "
-        f"https://docs.google.com/spreadsheets/d/"
-        f"{OUTPUT_SPREADSHEET_ID}/edit"
-    )
-    print(f"Output tab: {FULL_FLOW_SHEET_NAME}")
-    # In incremental mode the newly generated dataframe is named
-    # new_full_flow_df. Do not reference the old full_flow_df variable.
-    print(f"New Full Flow rows appended: {len(new_full_flow_df):,}")
+    print(f"New Full Flow rows appended: {len(new_full_flow_df):,} "
+          f"(after {existing_row_count:,} existing rows)")
     print("FMS source tab was not modified.")
-    print(
-        "Cancellation logic: "
-        f"{str(ENABLE_HISTORICAL_CANCELLATION).strip().upper()} "
-        f"(cutoff={CANCELLATION_CUTOFF_DATE})"
-    )
+    print(f"Cancellation logic: {str(ENABLE_HISTORICAL_CANCELLATION).strip().upper()}")
 
 
 if __name__ == "__main__":
