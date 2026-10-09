@@ -107,4 +107,18 @@
 
 ## Results on main
 
-(filled in after the main-branch runs)
+Fix commit `0ba2a32`.
+
+| run | mode | blank-P rows considered | matched (tier1/2/3) | fill cells | refresh cells | still unmatched | appended |
+|---|---|---|---|---|---|---|---|
+| 37861578756 (2026-10-08 nightly, old code) | write | 758 | 14 | 98 | — | 744 | 5 |
+| 37931236509 | dry-run | 749 | 25 (25/0/0) | 175 | 0 | 724 | would 47 |
+| 37931523767 | write | 749 | 25 (25/0/0) | **175 written** | 0 | 724 | **47 (rows 8,197–8,243)** |
+| 37931839960 (idempotency) | dry-run | 771 | 0 | 0 | 0 | 771 | 0 |
+
+- Write run 37931523767: every step succeeded (tests → Full Flow → artifact → POD → planned status).
+  POD: `Rows checked 8,236 · matched 3,162 · Closed rows left alone 0 · Total cells updated 0`;
+  planned status `21,386` cells (its normal nightly rewrite).
+- Oct form-month Order No 26 → 51; no other month changed (their blanks are not in Vinculum).
+- Suspect-cancellation report unchanged: 1,905 Cancelled rows, 206 with an invoiced Vinculum order
+  (artifact `fullflow-reports` of any run, e.g. 37931523767).
