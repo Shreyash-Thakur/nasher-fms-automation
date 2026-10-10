@@ -65,7 +65,7 @@
     with an `order_enquiry_orders_for_gt` column. Fill-rate tables unchanged (the projected one includes the
     new fills).
 - **Evidence:**
-  - Drive connector 2026-10-10: folder holds 31 daily `OrderEnquiry_DD-MM-YYYY` Google Sheets
+  - Drive connector 2026-10-10: folder holds 30 daily `OrderEnquiry_DD-MM-YYYY` Google Sheets
     (07-09-2026 … 09-10-2026; 14-09, 19-09, 20-09 missing) + the 5 monthly dumps above. Each daily file =
     orders of ONE order date (e.g. `OrderEnquiry_06-10-2026`: 330 rows, 330 unique Order Nos, all
     `06/10/2026`); no Order No repeats across the 11 files checked. Statuses seen on GT orders: Packed,
@@ -82,7 +82,7 @@
 - **Blast radius:** only the Full Flow script (P, S, and V/X via Pick Pack on rows that get a P this way;
   appended rows likewise). Drive access read-only. POD script matches by GT + Order No, so rows with a new P
   become eligible for POD lookup — intended. Planned-status script reads S (stage-1 Actual) — rows now get
-  their stage-1 actual on punch day instead of invoice day, which is the requested behaviour. Run time: +~31
+  their stage-1 actual on punch day instead of invoice day, which is the requested behaviour. Run time: +30
   small Drive exports.
 - **Still open:**
   - Q (Team) cannot come from the daily export (no "Created By" column); it fills when invoiced. Adding the
@@ -99,3 +99,38 @@
 - **Related:** [2026-10-09-full-flow-rows-empty-suffix-and-refresh.md](2026-10-09-full-flow-rows-empty-suffix-and-refresh.md)
   (suffix rule reused), [2026-10-10-pick-pack-google-sheets-skipped.md](2026-10-10-pick-pack-google-sheets-skipped.md)
   (reader reused), [2026-10-05-full-flow-blank-order-no-never-backfilled.md](2026-10-05-full-flow-blank-order-no-never-backfilled.md).
+
+## Live results
+
+- **Dry-run 38035984741 (commit e931ec0): success.** `Order Enquiry daily files found: 30; other files in the
+  folder ignored: 5` (the monthly dumps), `Order Enquiry files read: 30; rows: 11,631`, `11,631 unique Order
+  Nos (0 repeated across files); GT orders 285 (cancelled 12); unparsed Order Dates 0`.
+  `Rows with blank Order No considered: 771` -> `filled from Sales Master (invoiced lines): 18` (162 cells;
+  invoices that landed since the morning run) + `filled from Order Enquiry (punched orders): 33` (66 cells:
+  `oe_fill Order No 33`, `oe_fill Actual 33`, nothing else; all form month 2026-10), e.g.
+  `row 8197 GT081026A1 / NMHPP0816PS <- Vinculum GT081026A1 = N012268 (Packed, 08-Oct-2026 00:00:00)`,
+  `row 8193 GT071026A2 / NMH801912LS <- … = N89667 (Confirmed, 07-Oct-2026 18:47:00)`.
+  Not resolved: `GT has >1 live order 337 | only cancelled orders 112 | unique order already invoiced (SKU
+  not on it) 35 | GT in no Vinculum source 236`. Projected October P / Q / S: 51 / 51 / 51 -> 102 / 69 / 102
+  of 178. No other month changes.
+- **Write 38036427347: success** — `Fill/refresh complete: 228 cells written.` (162 + 66),
+  `New Full Flow rows appended: 17` (GT091026A1…A12: not yet punched / GT091026A1 has 2 orders -> P blank),
+  POD + planned-status steps success.
+- **Verification dry-run 38036850174** (reads the sheet back): `filled from Sales Master: 0`,
+  `filled from Order Enquiry: 0`, `refresh cells: 0`, `Would append 0 rows` (idempotent).
+  Live open-row fill rate, P / Q / S:
+
+  | form month | rows | P | Q | S |
+  |---|---|---|---|---|
+  | 2026-04 … 07 | 4,368 | 4,368 | 4,368 | 4,368 |
+  | 2026-08 | 467 | 363 | 363 | 363 |
+  | 2026-09 | 1,315 | 775 | 775 | 775 |
+  | 2026-10 | 195 (178 + 17 appended) | **102** (was 51) | 69 | **102** |
+
+  `Rows with an Order No not in the Sales Master (no invoice refresh yet): 49` (16 before + the 33 OE rows;
+  they refresh Q/AW/AX/AY/AS once invoiced).
+- Remaining blank P (737), `unmatched_rows.csv` reasons: `sku_differs 357` (GT invoiced, SKU not on an
+  invoiced line; mostly big GTs split into several orders incl. an extra `N461…` "Confirmed" order),
+  `punched_not_invoiced_multi_order 19`, `vinculum_order_cancelled 112` (105 of them GT070926A5: all six
+  Vinculum orders Cancelled — needs an Ops decision), `gt_not_in_vinculum 249` (Aug 49, Sep 171, Oct 29 incl.
+  the 12 new GT091026 rows: punched before 07-09, on the missing file days 14/19/20-09, or not punched).
