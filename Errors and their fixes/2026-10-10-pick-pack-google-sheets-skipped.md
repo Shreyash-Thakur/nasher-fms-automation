@@ -93,3 +93,15 @@
   `Rows with Order No anchored to a Vinculum line: 5,541 — of which get blank cells refreshed: 4,373 —
   refresh cells: 8,746` (`refresh Actual.1 4,373`, `refresh Warehouse Team 4,373`), no other column
   written, sample `row 1695 Actual.1 = '02-May-2026 18:04:54'`, `Warehouse Team = 'VinayakB'`.
+- **Dry-run 38024103479 (commit dba67fe): success.** Same reader / plan numbers as above
+  (128 files, 123,914 rows, 0 invalid Pick Dates, 4,373 rows / 8,746 cells, only `Actual.1` and
+  `Warehouse Team`, 0 rows appended). Before vs PROJECTED, open rows, V / X:
+  04: 1148 -> 1385 · 05: 0 -> 999 · 06: 0 -> 1129 · 07: 0 -> 855 · 08: 0 -> 348 (of 363 with P) ·
+  09: 0 -> 754 (of 775 with P) · 10: 0 -> 51 (of 51). No other column changes.
+- **Write 38024478148: success** — `Fill/refresh complete: 8,746 cells written.`, `Nothing to append.`,
+  POD + planned-status steps success.
+- **Verification dry-run 38024891150** (reads the sheet back): `of which get blank cells refreshed: 0`,
+  `refresh cells: 0` (idempotent), live fill-rate table V / X = 1385 / 999 / 1129 / 855 / 348 / 754 / 51
+  for 2026-04 … 2026-10 — equal to the projection; P, Q, S, AS, AW, AX, AY unchanged.
+- Remaining blanks: 15 Aug + 21 Sep rows have P but no Pick Pack entry yet (not picked / report not in
+  the folder); the 771 rows with blank P still need an Order No first (see 2026-10-09 record).
