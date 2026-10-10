@@ -77,15 +77,24 @@ def make(ff):
         base = {"Order No": "", "ExtOrderNo": "", "Order Date": "2026-09-05 10:00:00",
                 "SKU Code": "", "Created by": "Gauri", "Invoice No": "",
                 "Originating warehouse": "W1", "Pick Qty": 5, "Total": 1000}
-        return ff.prepare_sales_lines(pd.DataFrame([{**base, **r} for r in rows]))
+        frame = pd.DataFrame([{**base, **r} for r in rows]) if rows else pd.DataFrame(columns=list(base))
+        return ff.prepare_sales_lines(frame)
 
-    def plan(existing_rows, sales_rows, warehouse_mapping=None, pick_pack=None):
-        writes, stats, slots, unplaced = ff.plan_backfill(
+    def oe(rows):
+        """Daily Order Enquiry (order-level) rows -> prepared orders."""
+        base = {"Order No": "", "ExtOrderNo": "", "Order Date": "06/10/2026 11:58 PM",
+                "Status": "Confirmed"}
+        return ff.prepare_oe_orders(pd.DataFrame([{**base, **r} for r in rows]))
+
+    def plan(existing_rows, sales_rows, warehouse_mapping=None, pick_pack=None, oe_rows=None,
+             full=False):
+        result = ff.plan_backfill(
             existing(existing_rows), sales(sales_rows), pick_pack or {},
-            warehouse_mapping or {"W1": "Vadape"})
-        return writes, stats
+            warehouse_mapping or {"W1": "Vadape"},
+            oe_orders=oe(oe_rows) if oe_rows is not None else None)
+        return result if full else result[:2]
 
     def cells(writes):
         return {(w[0], w[1]): w[2] for w in writes}
 
-    return types.SimpleNamespace(existing=existing, sales=sales, plan=plan, cells=cells)
+    return types.SimpleNamespace(existing=existing, sales=sales, oe=oe, plan=plan, cells=cells)

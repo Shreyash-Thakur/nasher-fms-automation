@@ -49,6 +49,14 @@ ORDER_ENQUIRY_SHEET_NAMES = []
 
 PICK_PACK_FOLDER_ID = "1Xi66o4A0I3GdtlNrh61XcEWNkT5UKmey"
 
+# Daily Vinculum Order Enquiry exports (repo nasher-miles-report-automation, workflow
+# order-enquiry-report.yml): one Google Sheet per ORDER DATE, "OrderEnquiry_DD-MM-YYYY",
+# every punched order incl. not-yet-invoiced ones. ORDER-LEVEL (no SKU, no Created By).
+# The spreadsheet above (ORDER_ENQUIRY_SPREADSHEET_ID) is in fact the "Vinculum Sales
+# Master" (Sales Report = invoiced lines only). See read_order_enquiry_daily_files().
+ORDER_ENQUIRY_DAILY_FOLDER_ID = "1rinwTyd3BseS7o_FHP4Y907egQz39zBO"
+ORDER_ENQUIRY_DAILY_PREFIX = "orderenquiry_"   # compared lower-case; monthly dumps are ignored
+
 # ------------------------------------------------------------
 # ONE-TIME HISTORICAL CANCELLATION LOGIC
 # ------------------------------------------------------------
@@ -160,6 +168,10 @@ SALES_REQUIRED_COLUMNS = [
 ]
 
 PICK_PACK_REQUIRED_COLUMNS = ["Order No", "Pick Date", "Pick User"]
+
+# Daily Order Enquiry columns after normalize_sales_header ("Extern OrderNo" -> ExtOrderNo).
+# "Created by" is used for Team (Q) only if a future export carries it.
+OE_REQUIRED_COLUMNS = ["Order No", "ExtOrderNo", "Order Date", "Status"]
 
 
 # ============================================================
@@ -1053,19 +1065,28 @@ def _read_pick_pack_csv(raw_bytes):
     raise ValueError("not readable as CSV (utf-8 / cp1252 / latin1)")
 
 
-def _read_pick_pack_workbook(raw_bytes):
-    """Every tab that has the Pick Pack columns (a Google Sheet export may have several
-    tabs and the data tab is not always first). Real date cells come back as ISO text,
-    which parse_pick_date reads year-first. With no such tab, the first tab is returned
-    so the caller can report which columns it has."""
+def _read_workbook_tabs(raw_bytes, required, rename=None):
+    """Every tab that has the required columns (a Google Sheet export may have several
+    tabs and the data tab is not always first). Real date cells come back as ISO text.
+    With no such tab, the first tab is returned so the caller can report its columns."""
     tabs = pd.read_excel(io.BytesIO(raw_bytes), sheet_name=None, dtype=str,
                          keep_default_na=False, engine="openpyxl")
-    tabs = {title: _clean_pick_pack_columns(df) for title, df in tabs.items()}
-    good = [df for df in tabs.values()
-            if all(c in df.columns for c in PICK_PACK_REQUIRED_COLUMNS)]
+    cleaned = {}
+    for title, df in tabs.items():
+        df = _clean_pick_pack_columns(df)
+        if rename:
+            df.columns = [rename(c) for c in df.columns]
+        cleaned[title] = df
+    good = [df for df in cleaned.values() if all(c in df.columns for c in required)]
     if good:
         return pd.concat(good, ignore_index=True)
-    return next(iter(tabs.values())) if tabs else pd.DataFrame()
+    return next(iter(cleaned.values())) if cleaned else pd.DataFrame()
+
+
+def _read_pick_pack_workbook(raw_bytes):
+    """Pick Pack tabs of an xlsx / exported Google Sheet (parse_pick_date reads the ISO
+    text of real date cells year-first)."""
+    return _read_workbook_tabs(raw_bytes, PICK_PACK_REQUIRED_COLUMNS)
 
 
 def read_pick_pack_files():
@@ -1126,6 +1147,191 @@ def read_pick_pack_files():
     print(f"Pick Pack files read: {len(dataframes):,}")
     print(f"Total Pick Pack rows: {len(pick_pack_df):,}")
     return pick_pack_df
+
+
+# ============================================================
+# DAILY ORDER ENQUIRY (punched orders, incl. not invoiced) — 2026-10-10
+# ============================================================
+# Before: P/Q/S came only from the Sales Master (Vinculum Sales Report = invoiced lines),
+# so an order stayed blank in Full Flow until it was invoiced. The daily OrderEnquiry_*
+# exports list every punched order, ORDER-LEVEL: Order No, Extern OrderNo, Order Date
+# ("06/10/2026 11:58 PM", day-first), Status. No SKU and no Created By — see
+# OrderEnquiryIndex for the matching rule this forces.
+# Record: "Errors and their fixes/2026-10-10-order-no-blank-until-invoiced.md".
+
+def read_order_enquiry_daily_files():
+    """All OrderEnquiry_* files in the daily folder (Google Sheet / CSV / xlsx), same
+    reader as Pick Pack. A bad file is skipped with a WARNING. Adds _FILE and _FILE_RANK
+    (0 = most recently modified; the Drive listing is modifiedTime desc)."""
+    print("\nLooking for daily Order Enquiry files (OrderEnquiry_DD-MM-YYYY) in Google Drive...")
+    empty = pd.DataFrame(columns=OE_REQUIRED_COLUMNS + ["_FILE", "_FILE_RANK"])
+    try:
+        files = list_drive_files(ORDER_ENQUIRY_DAILY_FOLDER_ID)
+    except Exception as exc:
+        print(f"WARNING: Order Enquiry folder not listable -> {type(exc).__name__}: {exc}. "
+              f"P/S fill from Order Enquiry skipped this run.")
+        return empty
+    named = [f for f in files
+             if str(f.get("name", "")).strip().lower().startswith(ORDER_ENQUIRY_DAILY_PREFIX)]
+    candidates = [(f, _pick_pack_kind(f)) for f in named]
+    candidates = [(f, kind) for f, kind in candidates if kind]
+    print(f"Order Enquiry daily files found: {len(candidates):,}; "
+          f"other files in the folder ignored: {len(files) - len(candidates):,}")
+
+    frames, skipped = [], []
+    for rank, (file_info, kind) in enumerate(candidates):
+        name = file_info.get("name", file_info.get("id"))
+        try:
+            if kind == "csv":
+                df = _read_pick_pack_csv(download_drive_file(file_info["id"]).getvalue())
+                df.columns = [normalize_sales_header(c) for c in df.columns]
+            else:
+                raw = (export_drive_file(file_info["id"], XLSX_MIME) if kind == "gsheet"
+                       else download_drive_file(file_info["id"])).getvalue()
+                df = _read_workbook_tabs(raw, OE_REQUIRED_COLUMNS, rename=normalize_sales_header)
+        except Exception as exc:
+            print(f"WARNING: Order Enquiry file not readable, skipped: {name} [{kind}] "
+                  f"-> {type(exc).__name__}: {exc}")
+            skipped.append(name)
+            continue
+        missing = [c for c in OE_REQUIRED_COLUMNS if c not in df.columns]
+        if missing:
+            print(f"WARNING: Order Enquiry file skipped, missing columns {missing}: {name} "
+                  f"[{kind}] (has: {list(df.columns)[:12]})")
+            skipped.append(name)
+            continue
+        df = df.dropna(how="all").copy()
+        df["_FILE"] = name
+        df["_FILE_RANK"] = rank
+        frames.append(df)
+        print(f"Read: {name} [{kind}] -> {len(df):,} rows")
+
+    if skipped:
+        print(f"Order Enquiry files skipped: {len(skipped)} of {len(candidates)}")
+    if not frames:
+        print("WARNING: no Order Enquiry file could be read - P/S will only come from the "
+              "Sales Master (invoiced orders) this run.")
+        return empty
+    oe_df = pd.concat(frames, ignore_index=True)
+    print(f"Order Enquiry files read: {len(frames):,}; rows: {len(oe_df):,}")
+    return oe_df
+
+
+_OE_DATE_12H = re.compile(
+    r"^(\d{1,2})/(\d{1,2})/(\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([AaPp][Mm])$")
+
+
+def parse_oe_date(value):
+    """Order Enquiry "Order Date": "06/10/2026 11:58 PM" (dd/mm/yyyy, 12-hour) as exported
+    by Vinculum; anything else (ISO text of a real date cell, serial, 24-hour) goes through
+    parse_pick_date. Unreadable -> NaT (that row just gets no S)."""
+    text = "" if value is None else str(value).replace("\xa0", " ").strip()
+    match = _OE_DATE_12H.match(text)
+    if match:
+        day, month, year, hour, minute, second, ampm = match.groups()
+        hour = int(hour) % 12 + (12 if ampm.upper() == "PM" else 0)
+        try:
+            return pd.Timestamp(year=int(year), month=int(month), day=int(day), hour=hour,
+                                minute=int(minute), second=int(second or 0))
+        except ValueError:
+            return pd.NaT
+    return parse_pick_date(value)
+
+
+def prepare_oe_orders(oe_df):
+    """One row per Vinculum Order No (latest file wins), with _ORDER / _GT / _GT_BASE /
+    _CANCELLED and Order Date parsed."""
+    cols = OE_REQUIRED_COLUMNS + ["_ORDER", "_GT", "_GT_BASE", "_CANCELLED"]
+    if oe_df is None or oe_df.empty:
+        return pd.DataFrame(columns=cols)
+    df = oe_df.copy()
+    df["_ORDER"] = df["Order No"].map(normalize_value)
+    df = df[df["_ORDER"] != ""]
+    if "_FILE_RANK" in df.columns:
+        df = df.sort_values("_FILE_RANK", kind="stable")
+    before = len(df)
+    df = df.drop_duplicates("_ORDER", keep="first").reset_index(drop=True)
+    df["_GT"] = df["ExtOrderNo"].map(normalize_value)
+    df["_GT_BASE"] = df["ExtOrderNo"].map(gt_base)
+    df["_CANCELLED"] = df["Status"].map(lambda v: "cancel" in str(v).strip().lower())
+    df["Order Date"] = df["Order Date"].map(parse_oe_date)
+    gt_like = df["_GT"].str.startswith("GT")
+    print(f"Order Enquiry orders: {before:,} rows -> {len(df):,} unique Order Nos "
+          f"({before - len(df):,} repeated across files, latest file kept); "
+          f"GT orders {int(gt_like.sum()):,} (cancelled {int((gt_like & df['_CANCELLED']).sum()):,}); "
+          f"unparsed Order Dates {int(df['Order Date'].isna().sum()):,}")
+    return df
+
+
+class OrderEnquiryIndex:
+    """Which Vinculum order a Full Flow row belongs to, from ORDER-LEVEL data.
+
+    Rule (the export has no SKU, so a GT can only be resolved when it is unambiguous):
+      1. Candidate orders of a row = every LIVE Vinculum Order No known for its GT:
+         Order Enquiry orders (not Cancelled) + Sales Master orders + Order Nos already in
+         Full Flow P of rows with that GT; minus every order Order Enquiry says is Cancelled.
+         Exact normalised GT first; only if that yields nothing, the same GT base (one
+         trailing R/T/F stripped, equality only -> GT…A1 never meets GT…A10).
+      2. Exactly ONE candidate, present in Order Enquiry and NOT invoiced (no Sales Master
+         line) -> fill. An invoiced order belongs to the Sales Master, which is line-level:
+         if it did not match this SKU, Order Enquiry cannot overrule that.
+      3. Otherwise no fill; the outcome is recorded for the log / unmatched report.
+    """
+
+    def __init__(self, oe_orders, sales_lines, existing_df=None):
+        oe_orders = oe_orders if oe_orders is not None else prepare_oe_orders(None)
+        self.records, self.cancelled = {}, set()
+        self.by_gt, self.by_base, self.oe_by_base, self.cancelled_by_base = {}, {}, {}, {}
+        has_team = "Created by" in oe_orders.columns
+        for r in oe_orders.to_dict("records"):
+            order = r["_ORDER"]
+            if r["_GT_BASE"]:
+                self.oe_by_base.setdefault(r["_GT_BASE"], []).append(f"{r['Order No']}({r['Status']})")
+            if r["_CANCELLED"]:
+                self.cancelled.add(order)
+                if r["_GT_BASE"]:
+                    self.cancelled_by_base.setdefault(r["_GT_BASE"], set()).add(order)
+                continue
+            self.records[order] = {
+                "order_no": r["Order No"], "order_date": r["Order Date"],
+                "team": r["Created by"] if has_team else None, "status": r["Status"],
+                "ext_order_no": r["ExtOrderNo"]}
+            self._add(r["_GT"], r["_GT_BASE"], order)
+        self.invoiced = set(sales_lines["_ORDER"]) - {""}
+        for gt, base, order in zip(sales_lines["_GT"], sales_lines["_GT_BASE"], sales_lines["_ORDER"]):
+            self._add(gt, base, order)
+        if existing_df is not None and len(existing_df):
+            for gt_raw, p in zip(existing_df["GT Number"], existing_df["Order No"]):
+                order = normalize_value(p)
+                if order and order.lower() not in CLOSED_MARKERS:
+                    self._add(normalize_value(gt_raw), gt_base(gt_raw), order)
+
+    def _add(self, gt, base, order):
+        if not order:
+            return
+        if gt:
+            self.by_gt.setdefault(gt, set()).add(order)
+        if base:
+            self.by_base.setdefault(base, set()).add(order)
+
+    def match(self, gt, base):
+        """-> (order key or None, outcome)."""
+        if not base:
+            return None, "no_gt"
+        candidates = self.by_gt.get(gt, set()) - self.cancelled
+        if not candidates:
+            candidates = self.by_base.get(base, set()) - self.cancelled
+        if not candidates:
+            return None, ("only_cancelled" if self.cancelled_by_base.get(base)
+                          else "not_in_vinculum")
+        if len(candidates) > 1:
+            return None, "ambiguous"
+        (order,) = candidates
+        if order in self.invoiced:
+            return None, "unique_order_invoiced"
+        if order not in self.records:
+            return None, "unique_order_not_in_oe"
+        return order, "fill"
 
 
 # ============================================================
@@ -1304,13 +1510,15 @@ def build_pick_pack_lookup(pick_pack_df):
     return pick_pack_lookup
 
 
-def build_full_flow(fms_df, assigned, pick_pack_lookup, warehouse_mapping):
+def build_full_flow(fms_df, assigned, pick_pack_lookup, warehouse_mapping, oe_records=None):
     """Build output rows for FMS rows being appended.
 
     assigned[pos] = list of Order Enquiry lines (Series) that allocate_lines() gave
     to the pos-th fms_df row ([] = no Vinculum line yet; the row is appended with a
     blank Order No and the nightly fill picks it up later). One output row per line,
     so a GT+SKU punched as several Vinculum orders expands to several rows (as before).
+    oe_records[pos] = daily Order Enquiry order (OrderEnquiryIndex.records) for a row
+    with no Sales Master line, or None: gives Order No / Order Date (/ Team) only.
     """
     print("\nBuilding Full Flow rows to append...")
 
@@ -1328,6 +1536,7 @@ def build_full_flow(fms_df, assigned, pick_pack_lookup, warehouse_mapping):
     pick_pack_user_count = 0
     warehouse_match_count = 0
     warehouse_missing_count = 0
+    oe_fill_count = 0
 
     for pos, (_, fms_row) in enumerate(fms_df.iterrows()):
         base_row = {
@@ -1369,7 +1578,16 @@ def build_full_flow(fms_df, assigned, pick_pack_lookup, warehouse_mapping):
                 outputs.append(output_row)
         else:
             unmatched_fms_count += 1
-            outputs = [base_row.copy()]
+            output_row = base_row.copy()
+            oe_rec = oe_records[pos] if oe_records and pos < len(oe_records) else None
+            if oe_rec:
+                oe_fill_count += 1
+                for column, key in (("Order No", "order_no"), ("Actual", "order_date"),
+                                    ("Team", "team")):
+                    value = oe_rec.get(key)
+                    if value is not None and value_found(value) and not value_found(output_row[column]):
+                        output_row[column] = value
+            outputs = [output_row]
 
         for output_row in outputs:
             fms_order_no_key = normalize_value(output_row["Order No"])
@@ -1398,6 +1616,7 @@ def build_full_flow(fms_df, assigned, pick_pack_lookup, warehouse_mapping):
     print(f"FMS rows to append:            {len(fms_df):,}")
     print(f"FMS rows with Sales match:     {matched_fms_count:,}")
     print(f"FMS rows without Sales match:  {unmatched_fms_count:,}")
+    print(f"  ... P/S from Order Enquiry:  {oe_fill_count:,}")
     print(f"FMS rows expanded:             {expanded_fms_count:,}")
     print(f"Final Full Flow rows:          {len(full_flow_df):,}")
     print(f"Pick Pack matches:             {pick_pack_match_count:,}")
@@ -1436,6 +1655,12 @@ def build_full_flow(fms_df, assigned, pick_pack_lookup, warehouse_mapping):
 #    skips a bad file with a warning, parses ISO Pick Dates year-first, and also fills
 #    V/X on rows whose P is not in Order Enquiry (keyed by P). Record:
 #    "Errors and their fixes/2026-10-10-pick-pack-google-sheets-skipped.md".
+#  - 2026-10-10: P/Q/S blank until the order is INVOICED: the only source was the Sales
+#    Master (Vinculum Sales Report). The daily OrderEnquiry_* exports (every punched order,
+#    order-level) now fill P + S (+ V/X via Pick Pack) for blank-P rows the Sales Master
+#    does not match, when the GT maps to exactly one live, un-invoiced Vinculum order
+#    (OrderEnquiryIndex). Q waits for the invoice (the export has no Created By). Record:
+#    "Errors and their fixes/2026-10-10-order-no-blank-until-invoiced.md".
 #
 # BACKFILL_MODE env: "write" (default in CI), "dry-run" (log only, this script writes
 # NOTHING — no fills, no appends), "off" (no fills; appends as before).
@@ -1558,7 +1783,7 @@ def prepare_sales_lines(sales_df):
 class _Slot:
     """One Full Flow row (existing) or FMS row (to be appended) taking part in matching."""
     __slots__ = ("kind", "ref", "gt", "base", "sku", "sku_alt", "order", "closed",
-                 "anchor", "assigned", "tier")
+                 "anchor", "assigned", "tier", "oe_order", "oe_outcome")
 
     def __init__(self, kind, ref, row):
         self.kind = kind
@@ -1573,6 +1798,8 @@ class _Slot:
         self.anchor = None      # line id already recorded in P (refresh source)
         self.assigned = []      # line ids given to a blank row / new row
         self.tier = None
+        self.oe_order = None    # daily Order Enquiry order key used for P/S (no Sales line)
+        self.oe_outcome = None  # OrderEnquiryIndex.match outcome for a row left unmatched
 
 
 def _match_tier(slot, line):
@@ -1680,13 +1907,32 @@ def _pick_pack_cells(row, order_key, pick_pack_lookup, sheet_row, reason):
     return cells
 
 
-def plan_existing_writes(existing_df, slots, lines, pick_pack_lookup, warehouse_mapping):
+def _oe_cells(row, record, order_key, pick_pack_lookup, sheet_row):
+    """P (Order No), S (Order Date) and - only if the export carries Created By - Q from a
+    daily Order Enquiry order; V/X from Pick Pack by that Order No. Blank cells only.
+    Invoice fields (AS/AW/AX/AY) are never taken from Order Enquiry."""
+    cells = []
+    for column, key in (("Order No", "order_no"), ("Actual", "order_date"), ("Team", "team")):
+        value = record.get(key)
+        if value is not None and value_found(value) and not value_found(row[column]):
+            cells.append((sheet_row, column, value, "oe_fill"))
+    cells += _pick_pack_cells(row, order_key, pick_pack_lookup, sheet_row, "oe_fill")
+    return cells
+
+
+def plan_existing_writes(existing_df, slots, lines, pick_pack_lookup, warehouse_mapping,
+                         oe_index=None):
     """Cell writes for existing rows: blank cells only, never a closed row.
+    Sales Master line first; a blank-P row it does not match may get P/S from the daily
+    Order Enquiry (oe_index, see OrderEnquiryIndex).
     Returns (writes, stats); writes = [(sheet_row, output_column, value, reason)]."""
     stats = {"blank_p_rows": 0, "filled_rows": 0, "fill_cells": 0,
              "still_unmatched": 0, "refreshed_rows": 0, "refresh_cells": 0,
              "tiers": {1: 0, 2: 0, 3: 0}, "anchored_rows": 0,
-             "stale_zero_dispatched": 0, "order_no_without_line": 0}
+             "stale_zero_dispatched": 0, "order_no_without_line": 0,
+             "oe_filled_rows": 0, "oe_fill_cells": 0,
+             "oe_outcomes": {k: 0 for k in ("ambiguous", "only_cancelled", "unique_order_invoiced",
+                                            "unique_order_not_in_oe", "not_in_vinculum", "no_gt")}}
     writes = []
     for slot in slots:
         if slot.kind != "existing" or slot.closed:
@@ -1696,6 +1942,19 @@ def plan_existing_writes(existing_df, slots, lines, pick_pack_lookup, warehouse_
         if not slot.order:
             stats["blank_p_rows"] += 1
             if not slot.assigned:
+                order_key, outcome = (oe_index.match(slot.gt, slot.base) if oe_index is not None
+                                      else (None, "not_in_vinculum"))
+                slot.oe_outcome = outcome
+                if order_key:
+                    row_cells = _oe_cells(row, oe_index.records[order_key], order_key,
+                                          pick_pack_lookup, 8 + int(i))
+                    if row_cells:
+                        slot.oe_order = order_key
+                        stats["oe_filled_rows"] += 1
+                        stats["oe_fill_cells"] += len(row_cells)
+                        writes.extend(row_cells)
+                        continue
+                stats["oe_outcomes"][outcome] = stats["oe_outcomes"].get(outcome, 0) + 1
                 stats["still_unmatched"] += 1
                 continue
             line_id, reason = slot.assigned[0], "fill"
@@ -1745,13 +2004,16 @@ def plan_existing_writes(existing_df, slots, lines, pick_pack_lookup, warehouse_
     return writes, stats
 
 
-def plan_backfill(existing_df, sales_lines, pick_pack_lookup, warehouse_mapping):
+def plan_backfill(existing_df, sales_lines, pick_pack_lookup, warehouse_mapping,
+                  oe_orders=None):
     """Existing rows only (no appends). Kept as the single entry point the tests use.
+    oe_orders = prepare_oe_orders() output (daily Order Enquiry) or None.
     Returns (writes, stats, slots, unplaced)."""
     slots = [_Slot("existing", i, row) for i, row in existing_df.iterrows()]
     unplaced = allocate_lines(slots, sales_lines)
+    oe_index = OrderEnquiryIndex(oe_orders, sales_lines, existing_df)
     writes, stats = plan_existing_writes(existing_df, slots, sales_lines,
-                                         pick_pack_lookup, warehouse_mapping)
+                                         pick_pack_lookup, warehouse_mapping, oe_index)
     stats["unplaced_sales_lines"] = len(unplaced)
     return writes, stats, slots, unplaced
 
@@ -1843,10 +2105,24 @@ def report_suspect_cancellations(existing_df, sales_lines, path=None):
     return report
 
 
-def _print_unmatched_diagnostics(existing_df, slots, sales_lines, limit=15, path=None):
-    """READ-ONLY. For blank-P rows that still have no line: is the GT base in Vinculum
-    at all, which SKUs does Vinculum hold for it, and which ExtOrderNos merely CONTAIN
-    the GT base (formatting variants). Writes a CSV for offline analysis."""
+# Unmatched-row reasons (unmatched_rows.csv "reason"), from the Sales Master (invoiced
+# lines) and the daily Order Enquiry (punched orders, order-level):
+UNMATCHED_REASONS = {
+    "sku_differs": "GT invoiced (Sales Master) but no line for this SKU",
+    "punched_not_invoiced_multi_order": "punched, not invoiced, GT has >1 live Vinculum order "
+                                        "(order-level Order Enquiry cannot pick one)",
+    "vinculum_order_cancelled": "every Vinculum order of the GT is Cancelled",
+    "gt_not_in_vinculum": "GT in neither Sales Master nor Order Enquiry (not punched yet, "
+                          "or punched before the daily files start)",
+}
+
+
+def _print_unmatched_diagnostics(existing_df, slots, sales_lines, limit=15, path=None,
+                                 oe_index=None):
+    """READ-ONLY. For blank-P rows that still have no Vinculum order: why (see
+    UNMATCHED_REASONS), which SKUs the Sales Master holds for the GT, which Order Enquiry
+    orders exist for it, and which ExtOrderNos merely CONTAIN the GT base (formatting
+    variants). Writes a CSV for offline analysis."""
     bases = set(sales_lines["_GT_BASE"]) - {""}
     lines_by_base = {}
     for lid, base in sales_lines["_GT_BASE"].items():
@@ -1860,14 +2136,14 @@ def _print_unmatched_diagnostics(existing_df, slots, sales_lines, limit=15, path
     unique_ext = sorted(set(sales_lines["_GT"]) - {""})
     print("Order Enquiry columns: " + " | ".join(str(c) for c in sales_lines.columns
                                                   if not str(c).startswith("_")))
-    gt_absent = gt_present = 0
+    counts = {reason: 0 for reason in UNMATCHED_REASONS}
     samples, rows = [], []
     for slot in slots:
-        if slot.kind != "existing" or slot.closed or slot.order or slot.assigned:
+        if slot.kind != "existing" or slot.closed or slot.order or slot.assigned or slot.oe_order:
             continue
         row = existing_df.loc[slot.ref]
+        oe_orders = " ".join(oe_index.oe_by_base.get(slot.base, [])) if oe_index else ""
         if slot.base in bases:
-            gt_present += 1
             reason = "sku_differs"
             lids = lines_by_base[slot.base]
             vin = [f"{sales_lines.at[l, '_SKU']}={sales_lines.at[l, '_ORDER']}"
@@ -1878,8 +2154,9 @@ def _print_unmatched_diagnostics(existing_df, slots, sales_lines, limit=15, path
                                f" (alt {slot.sku_alt or '-'}) ; Vinculum has "
                                + ", ".join(vin[:8]))
         else:
-            gt_absent += 1
-            reason = "gt_not_in_vinculum"
+            reason = {"ambiguous": "punched_not_invoiced_multi_order",
+                      "only_cancelled": "vinculum_order_cancelled"}.get(slot.oe_outcome,
+                                                                         "gt_not_in_vinculum")
             vin = []
             near = [e for e in unique_ext
                     if slot.base and slot.base in e and e != slot.base
@@ -1889,10 +2166,13 @@ def _print_unmatched_diagnostics(existing_df, slots, sales_lines, limit=15, path
             "vinculum_sku": slot.sku, "sku_code": slot.sku_alt,
             "form_received": row["Form Received Time"], "party": row.get("Party Name", ""),
             "reason": reason, "vinculum_lines_for_gt (*=used)": " ".join(vin),
+            "order_enquiry_orders_for_gt": oe_orders,
             "ext_order_nos_containing_gt": " ".join(near),
         })
-    print(f"Still unmatched, GT base NOT in Vinculum (not punched yet): {gt_absent:,}")
-    print(f"Still unmatched, GT base in Vinculum but no SKU match:      {gt_present:,}")
+        counts[reason] += 1
+    print("Still unmatched (blank P after Sales Master + Order Enquiry), by reason:")
+    for reason, text in UNMATCHED_REASONS.items():
+        print(f"  {reason:<34} {counts[reason]:>6,}  {text}")
     near_count = sum(1 for r in rows if r["ext_order_nos_containing_gt"])
     print(f"  ... GT not in Vinculum but an ExtOrderNo CONTAINS it:     {near_count:,}")
     for s in samples:
@@ -1982,6 +2262,7 @@ def main():
     print(f"Order Enquiry Spreadsheet:  {ORDER_ENQUIRY_SPREADSHEET_ID}")
     print(f"Order Enquiry tabs config:  {ORDER_ENQUIRY_SHEET_NAMES if ORDER_ENQUIRY_SHEET_NAMES else 'ALL TABS'}")
     print(f"Pick Pack folder ID:        {PICK_PACK_FOLDER_ID}")
+    print(f"Order Enquiry daily folder: {ORDER_ENQUIRY_DAILY_FOLDER_ID}")
     print(f"Mode (BACKFILL_MODE):       {BACKFILL_MODE}")
     if BACKFILL_MODE not in ("write", "dry-run", "off"):
         raise SystemExit(f"Unknown BACKFILL_MODE {BACKFILL_MODE!r} (write / dry-run / off)")
@@ -1993,6 +2274,7 @@ def main():
     fms_df = read_fms_sheet()
     sales_df = read_sales_file()
     pick_pack_df = read_pick_pack_files()
+    oe_daily_df = read_order_enquiry_daily_files()
     warehouse_mapping = read_warehouse_mapping()
 
     # Disabled since 2026-10-09 (ENABLE_HISTORICAL_CANCELLATION = "NO"); kept so the
@@ -2003,6 +2285,7 @@ def main():
     existing_full_flow_df = read_existing_full_flow()
 
     sales_lines = prepare_sales_lines(sales_df.copy())
+    oe_orders = prepare_oe_orders(oe_daily_df)
     try:
         pick_pack_lookup = build_pick_pack_lookup(pick_pack_df.copy())
     except SystemExit:
@@ -2036,9 +2319,13 @@ def main():
     new_slots = [_Slot("new", pos, row)
                  for pos, (_, row) in enumerate(fms_to_append.iterrows())]
     unplaced = allocate_lines(slots + new_slots, sales_lines)
+    oe_index = OrderEnquiryIndex(oe_orders, sales_lines, existing_full_flow_df)
 
     writes, stats = plan_existing_writes(existing_full_flow_df, slots, sales_lines,
-                                         pick_pack_lookup, warehouse_mapping)
+                                         pick_pack_lookup, warehouse_mapping, oe_index)
+    for s in new_slots:
+        if not s.assigned:
+            s.oe_order, s.oe_outcome = oe_index.match(s.gt, s.base)
 
     print("\n" + "=" * 80)
     print(f"FILL + REFRESH EXISTING ROWS  —  mode: {BACKFILL_MODE}")
@@ -2051,11 +2338,27 @@ def main():
           f"(tier1 exact {stats['tiers'][1]:,} | tier2 R/T/F suffix {stats['tiers'][2]:,} | "
           f"tier3 alt SKU {stats['tiers'][3]:,})")
     print(f"  cells:                                      {stats['fill_cells']:,}")
+    print(f"  filled from Sales Master (invoiced lines):  {stats['filled_rows']:,}")
+    print(f"  filled from Order Enquiry (punched orders): {stats['oe_filled_rows']:,}  "
+          f"(cells {stats['oe_fill_cells']:,}; P/S only, + V/X from Pick Pack)")
+    oe_months = {}
+    for s in slots:
+        if s.oe_order:
+            m = _month_of(existing_full_flow_df.at[s.ref, "Form Received Time"])
+            oe_months[m] = oe_months.get(m, 0) + 1
+    if oe_months:
+        print("    by form month: " + ", ".join(f"{m} {c}" for m, c in sorted(oe_months.items())))
     print(f"Rows still without a Vinculum match:          {stats['still_unmatched']:,}")
+    o = stats["oe_outcomes"]
+    print(f"  Order Enquiry could not resolve them: GT has >1 live order {o['ambiguous']:,} | "
+          f"only cancelled orders {o['only_cancelled']:,} | unique order already invoiced "
+          f"(SKU not on it) {o['unique_order_invoiced']:,} | unique order known only from P "
+          f"{o['unique_order_not_in_oe']:,} | GT in no Vinculum source {o['not_in_vinculum']:,}")
     print(f"Rows with Order No anchored to a Vinculum line: {stats['anchored_rows']:,}")
     print(f"  of which get blank cells refreshed:         {stats['refreshed_rows']:,}")
     print(f"  refresh cells:                              {stats['refresh_cells']:,}")
-    print(f"Rows with an Order No not found in Vinculum (no refresh): {stats['order_no_without_line']:,}")
+    print(f"Rows with an Order No not in the Sales Master (no invoice refresh yet): "
+          f"{stats['order_no_without_line']:,}")
     print(f"Rows with Dispatched Qty 0 but Vinculum picked >0 (not overwritten): "
           f"{stats['stale_zero_dispatched']:,}")
     print(f"Extra Vinculum lines not placed (split shipments): {len(unplaced):,}")
@@ -2069,6 +2372,11 @@ def main():
         print(f"  {reason:<8} {column:<16} {count:,}")
     for sheet_row, column, value, reason in writes[:10]:
         print(f"  sample {reason}: row {sheet_row} {column} = {clean_for_google(value)!r}")
+    for s in [s for s in slots if s.oe_order][:15]:
+        rec = oe_index.records[s.oe_order]
+        print(f"  order-enquiry match: row {8 + int(s.ref)} {s.gt} / {s.sku} <- Vinculum "
+              f"{rec['ext_order_no']} = {rec['order_no']} ({rec['status']}, "
+              f"{clean_for_google(rec['order_date'])})")
     tier2 = [s for s in slots if s.kind == "existing" and s.assigned and s.tier == 2][:10]
     for s in tier2:
         line = sales_lines.loc[s.assigned[0]]
@@ -2081,7 +2389,8 @@ def main():
               f"Vinculum {line['ExtOrderNo']} / {line['SKU Code']} "
               f"(bundle {line.get('Bundle SKU Code', '')}) = {line['Order No']}")
     _print_unmatched_diagnostics(existing_full_flow_df, slots, sales_lines,
-                                 path=os.path.join("reports", "unmatched_rows.csv"))
+                                 path=os.path.join("reports", "unmatched_rows.csv"),
+                                 oe_index=oe_index)
 
     _print_fill_rates(existing_full_flow_df)
     _print_fill_rates(existing_full_flow_df, writes=writes)
@@ -2094,8 +2403,9 @@ def main():
     # BUILD ROWS TO APPEND
     # --------------------------------------------------------
     assigned = [[sales_lines.loc[lid] for lid in s.assigned] for s in new_slots]
+    oe_records = [oe_index.records[s.oe_order] if s.oe_order else None for s in new_slots]
     new_full_flow_df = build_full_flow(fms_to_append, assigned, pick_pack_lookup,
-                                       warehouse_mapping) if len(fms_to_append) else \
+                                       warehouse_mapping, oe_records) if len(fms_to_append) else \
         pd.DataFrame(columns=OUTPUT_COLUMNS)
 
     if dry_run:
