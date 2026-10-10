@@ -232,9 +232,17 @@ def test_closed_row_v_x_untouched(make):
 
 
 def test_projected_fill_rates(ff, make, capsys):
+    # CI runs pandas 3 (string dtype by default): projecting a datetime into a string
+    # column must not raise (dry-run 38023719561 died on exactly that).
     existing = make.existing([
         {"GT Number": "GT1", "Vinculum SKU": "S", "Order No": "N1",
-         "Form Received Time": "03/06/2026 10:00:00"}])
-    ff._print_fill_rates(existing, writes=[(8, "Warehouse Team", "Bidyut", "refresh")])
+         "Form Received Time": "03/06/2026 10:00:00"}]).astype("string")
+    ff._print_fill_rates(existing, writes=[(8, "Warehouse Team", "Bidyut", "refresh"),
+                                           (8, "Actual.1", datetime(2026, 6, 3, 11), "refresh")])
     out = capsys.readouterr().out
     assert "projected" in out.lower()
+    header, row = out.strip().splitlines()[-2:]
+    cols = header.split()
+    vals = row.split()
+    assert vals[cols.index("V")] == "1" and vals[cols.index("X")] == "1", out
+    assert existing.loc[0, "Warehouse Team"] == ""          # caller's frame untouched

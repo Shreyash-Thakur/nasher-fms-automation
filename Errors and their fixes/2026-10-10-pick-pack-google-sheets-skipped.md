@@ -81,4 +81,15 @@
 
 ## Live results
 
-(filled in after the CI dry-run and write run)
+- **Dry-run 38023719561 (commit af306e9) FAILED** after planning, in the new projected fill-rate table:
+  `TypeError: Invalid value '2026-05-02 18:04:54' for dtype 'str'. Value should be a string or missing
+  value, got 'datetime' instead.` (`_print_fill_rates` -> `existing_df.at[...] = value`). CI installs
+  pandas 3.0.6, whose default string dtype refuses a datetime; local pandas 2.2.3 does not, so the test
+  passed locally. Fix: project on `existing_df.astype(object)`; the test now uses a `"string"`-dtype frame
+  and fails without the fix (`TypeError: Cannot set non-string value ... into a StringArray`).
+  Everything before it was already right in that run:
+  `Pick Pack files found: 128  (csv 10 | google sheet 118 | xlsx 0); other files ignored: 0`,
+  `Pick Pack files read: 128`, `Total Pick Pack rows: 123,914`, `Valid Pick Dates: 123,914 / Invalid 0`,
+  `Rows with Order No anchored to a Vinculum line: 5,541 — of which get blank cells refreshed: 4,373 —
+  refresh cells: 8,746` (`refresh Actual.1 4,373`, `refresh Warehouse Team 4,373`), no other column
+  written, sample `row 1695 Actual.1 = '02-May-2026 18:04:54'`, `Warehouse Team = 'VinayakB'`.

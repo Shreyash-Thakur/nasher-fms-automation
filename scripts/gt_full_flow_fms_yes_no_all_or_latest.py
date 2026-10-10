@@ -1923,7 +1923,9 @@ def _print_fill_rates(existing_df, writes=None):
     With writes, the table is the PROJECTION after this run's fills/refreshes."""
     closed = existing_df.apply(row_is_closed, axis=1)
     if writes is not None:
-        existing_df = existing_df.copy()
+        # object copy: under pandas 3 (CI) the columns are string dtype and refuse the
+        # datetime / number values the writes carry.
+        existing_df = existing_df.astype(object)
         for sheet_row, column, value, _ in writes:
             existing_df.at[sheet_row - 8, column] = value
     open_rows = existing_df[~closed]
