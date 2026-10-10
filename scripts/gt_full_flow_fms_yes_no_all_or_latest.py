@@ -288,7 +288,16 @@ def list_drive_files(folder_id, extension=None):
 
 
 def download_drive_file(file_id):
-    request = drive_service.files().get_media(fileId=file_id)
+    return _download_request(drive_service.files().get_media(fileId=file_id))
+
+
+def export_drive_file(file_id, mime_type):
+    """Native Google file (e.g. a Google Sheet) exported to mime_type."""
+    return _download_request(
+        drive_service.files().export_media(fileId=file_id, mimeType=mime_type))
+
+
+def _download_request(request):
     buffer = io.BytesIO()
     downloader = MediaIoBaseDownload(buffer, request)
     done = False
@@ -767,7 +776,34 @@ def parse_pick_date(value):
         except Exception:
             return pd.NaT
 
-    return pd.to_datetime(value, dayfirst=True, errors="coerce")
+    # ISO yyyy-mm-dd[ hh:mm[:ss]] — the form real date cells take when a Google Sheet is
+    # exported to xlsx and read as text, and the form of the May/June 2026 sheets
+    # ("2026-05-02 9:34:53"). Must be handled BEFORE the day-first fallback below:
+    # pd.to_datetime("2026-05-02 9:34:53", dayfirst=True) returns 2026-02-05.
+    match = re.match(
+        r"^(\d{4})-(\d{1,2})-(\d{1,2})"
+        r"(?:[ T](\d{1,2}):(\d{2})(?::(\d{1,2}))?(?:\.\d+)?)?$",
+        value,
+    )
+    if match:
+        try:
+            return pd.Timestamp(
+                year=int(match.group(1)),
+                month=int(match.group(2)),
+                day=int(match.group(3)),
+                hour=int(match.group(4) or 0),
+                minute=int(match.group(5) or 0),
+                second=int(match.group(6) or 0),
+            )
+        except Exception:
+            return pd.NaT
+
+    # Anything else: day-first best effort; a value that cannot be read is blank
+    # (that row simply gets no X), it never aborts the run.
+    try:
+        return pd.to_datetime(value, dayfirst=True, errors="coerce")
+    except Exception:
+        return pd.NaT
 
 
 # ============================================================
@@ -968,68 +1004,126 @@ def read_sales_file():
     return sales_df
 
 
+# Pick Pack file kinds. 2026-10-10: since May 2026 the daily reports arrive in the folder
+# as native Google Sheets ("PickPackReport_08.10.2026", no extension); the old reader kept
+# only names ending ".csv", so it saw April only and V/X stayed blank from May on.
+GOOGLE_SHEET_MIME = "application/vnd.google-apps.spreadsheet"
+XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def _pick_pack_kind(file_info):
+    """"csv" / "gsheet" / "xlsx", or None for a file that is not a Pick Pack report."""
+    name = str(file_info.get("name", "")).lower()
+    mime = file_info.get("mimeType", "")
+    if mime == GOOGLE_SHEET_MIME:
+        return "gsheet"
+    if name.endswith(".csv") or mime == "text/csv":
+        return "csv"
+    if name.endswith((".xlsx", ".xlsm")) or mime == XLSX_MIME:
+        return "xlsx"
+    return None
+
+
+def _clean_pick_pack_columns(df):
+    # Header cells can carry a BOM, NBSPs and - in Sheets made by importing a CSV - the
+    # literal quotes of the CSV header ('\ufeff"Order No"').
+    df.columns = (
+        df.columns.astype(str)
+        .str.replace("\ufeff", "", regex=False)
+        .str.replace("\xa0", " ", regex=False)
+        .str.strip()
+        .str.strip("\"'")
+        .str.strip()
+    )
+    return df
+
+
+def _read_pick_pack_csv(raw_bytes):
+    for encoding in ["utf-8-sig", "cp1252", "latin1"]:
+        try:
+            return _clean_pick_pack_columns(pd.read_csv(
+                io.BytesIO(raw_bytes),
+                encoding=encoding,
+                dtype=str,
+                keep_default_na=False,
+                low_memory=False,
+            ))
+        except Exception:
+            pass
+    raise ValueError("not readable as CSV (utf-8 / cp1252 / latin1)")
+
+
+def _read_pick_pack_workbook(raw_bytes):
+    """Every tab that has the Pick Pack columns (a Google Sheet export may have several
+    tabs and the data tab is not always first). Real date cells come back as ISO text,
+    which parse_pick_date reads year-first. With no such tab, the first tab is returned
+    so the caller can report which columns it has."""
+    tabs = pd.read_excel(io.BytesIO(raw_bytes), sheet_name=None, dtype=str,
+                         keep_default_na=False, engine="openpyxl")
+    tabs = {title: _clean_pick_pack_columns(df) for title, df in tabs.items()}
+    good = [df for df in tabs.values()
+            if all(c in df.columns for c in PICK_PACK_REQUIRED_COLUMNS)]
+    if good:
+        return pd.concat(good, ignore_index=True)
+    return next(iter(tabs.values())) if tabs else pd.DataFrame()
+
+
 def read_pick_pack_files():
-    print("\nLooking for Pick Pack CSV files in Google Drive...")
+    print("\nLooking for Pick Pack files (CSV / Google Sheet / Excel) in Google Drive...")
 
     files = list_drive_files(PICK_PACK_FOLDER_ID)
-    csv_files = [f for f in files if f["name"].lower().endswith(".csv")]
+    candidates = [(f, _pick_pack_kind(f)) for f in files]
+    ignored = [f for f, kind in candidates if kind is None]
+    candidates = [(f, kind) for f, kind in candidates if kind]
+    by_kind = {k: sum(1 for _, kind in candidates if kind == k) for k in ("csv", "gsheet", "xlsx")}
 
-    if not csv_files:
-        raise FileNotFoundError(
-            "No Pick Pack CSV files found in the configured Google Drive folder."
-        )
+    print(f"Pick Pack files found: {len(candidates):,}  (csv {by_kind['csv']} | "
+          f"google sheet {by_kind['gsheet']} | xlsx {by_kind['xlsx']}); "
+          f"other files ignored: {len(ignored)}")
+    for f in ignored:
+        print(f"  ignored: {f.get('name')} ({f.get('mimeType')})")
 
-    print(f"Pick Pack CSV files found: {len(csv_files):,}")
-    for f in csv_files:
-        print(f"  {f['name']}")
+    dataframes, skipped = [], []
 
-    dataframes = []
-
-    for file_info in csv_files:
-        buffer = download_drive_file(file_info["id"])
-        raw_bytes = buffer.getvalue()
-        df = None
-
-        for encoding in ["utf-8-sig", "cp1252", "latin1"]:
-            try:
-                df = pd.read_csv(
-                    io.BytesIO(raw_bytes),
-                    encoding=encoding,
-                    dtype=str,
-                    keep_default_na=False,
-                    low_memory=False,
-                )
-                break
-            except Exception:
-                pass
-
-        if df is None:
-            print(f"ERROR reading {file_info['name']}; skipped.")
+    for file_info, kind in candidates:
+        name = file_info.get("name", file_info.get("id"))
+        try:
+            if kind == "gsheet":
+                df = _read_pick_pack_workbook(export_drive_file(file_info["id"], XLSX_MIME).getvalue())
+            elif kind == "xlsx":
+                df = _read_pick_pack_workbook(download_drive_file(file_info["id"]).getvalue())
+            else:
+                df = _read_pick_pack_csv(download_drive_file(file_info["id"]).getvalue())
+        except Exception as exc:
+            # One bad / unshared file must not cost the whole night.
+            print(f"WARNING: Pick Pack file not readable, skipped: {name} [{kind}] "
+                  f"-> {type(exc).__name__}: {exc}")
+            skipped.append(name)
             continue
 
-        df.columns = (
-            df.columns.astype(str)
-            .str.replace("\ufeff", "", regex=False)
-            .str.replace("\xa0", " ", regex=False)
-            .str.strip()
-        )
+        missing = [c for c in PICK_PACK_REQUIRED_COLUMNS if c not in df.columns]
+        if missing:
+            print(f"WARNING: Pick Pack file skipped, missing columns {missing}: {name} [{kind}] "
+                  f"(has: {list(df.columns)[:12]})")
+            skipped.append(name)
+            continue
+
         df = df.dropna(how="all")
         dataframes.append(df)
-        print(f"Read: {file_info['name']} -> {len(df):,} rows")
+        print(f"Read: {name} [{kind}] -> {len(df):,} rows")
+
+    if skipped:
+        print(f"Pick Pack files skipped: {len(skipped)} of {len(candidates)}")
 
     if not dataframes:
-        raise ValueError("No Pick Pack CSV could be read.")
+        print("WARNING: no Pick Pack file could be read - Warehouse Team (V) / "
+              "Actual.1 (X) will not be filled this run.")
+        return pd.DataFrame(columns=PICK_PACK_REQUIRED_COLUMNS)
 
     pick_pack_df = pd.concat(dataframes, ignore_index=True)
     pick_pack_df = pick_pack_df.dropna(how="all").reset_index(drop=True)
 
-    missing = [c for c in PICK_PACK_REQUIRED_COLUMNS if c not in pick_pack_df.columns]
-    if missing:
-        print("Actual Pick Pack columns found:")
-        for col in pick_pack_df.columns:
-            print(f"  [{col}]")
-        raise ValueError("Missing Pick Pack columns:\n" + "\n".join(missing))
-
+    print(f"Pick Pack files read: {len(dataframes):,}")
     print(f"Total Pick Pack rows: {len(pick_pack_df):,}")
     return pick_pack_df
 
@@ -1336,6 +1430,12 @@ def build_full_flow(fms_df, assigned, pick_pack_lookup, warehouse_mapping):
 #      3. Processing was append-only per GT, so a new SKU line for a GT already in
 #         Full Flow never arrived. Now any FMS GT+SKU not yet in Full Flow is appended.
 #    Cancelled / Virtual Invoice / OOS rows are never written.
+#  - 2026-10-10: V (Warehouse Team) / X (Actual.1) blank from May 2026 on. Pick Pack
+#    reports have arrived as native Google Sheets since May and read_pick_pack_files
+#    kept only "*.csv" names. It now reads CSV + Google Sheet (xlsx export) + xlsx,
+#    skips a bad file with a warning, parses ISO Pick Dates year-first, and also fills
+#    V/X on rows whose P is not in Order Enquiry (keyed by P). Record:
+#    "Errors and their fixes/2026-10-10-pick-pack-google-sheets-skipped.md".
 #
 # BACKFILL_MODE env: "write" (default in CI), "dry-run" (log only, this script writes
 # NOTHING — no fills, no appends), "off" (no fills; appends as before).
@@ -1564,6 +1664,22 @@ def allocate_lines(slots, lines):
     return unplaced
 
 
+def _pick_pack_cells(row, order_key, pick_pack_lookup, sheet_row, reason):
+    """X (Actual.1) <- latest Pick Date, V (Warehouse Team) <- its Pick User, for the
+    Vinculum Order No order_key; blank cells only."""
+    pick = pick_pack_lookup.get(order_key) if order_key else None
+    cells = []
+    if not pick:
+        return cells
+    if pick["Pick Date"] is not None and not pd.isna(pick["Pick Date"]) \
+            and not value_found(row["Actual.1"]):
+        cells.append((sheet_row, "Actual.1",
+                      pd.Timestamp(pick["Pick Date"]).to_pydatetime(), reason))
+    if value_found(pick["Pick User"]) and not value_found(row["Warehouse Team"]):
+        cells.append((sheet_row, "Warehouse Team", pick["Pick User"], reason))
+    return cells
+
+
 def plan_existing_writes(existing_df, slots, lines, pick_pack_lookup, warehouse_mapping):
     """Cell writes for existing rows: blank cells only, never a closed row.
     Returns (writes, stats); writes = [(sheet_row, output_column, value, reason)]."""
@@ -1588,7 +1704,15 @@ def plan_existing_writes(existing_df, slots, lines, pick_pack_lookup, warehouse_
             line_id, reason = slot.anchor, "refresh"
             stats["anchored_rows"] += 1
         else:
+            # P is filled but its line is not in Order Enquiry. Pick Pack is keyed by
+            # Order No, so V/X can still come from the row's own P (blank cells only).
             stats["order_no_without_line"] += 1
+            row_cells = _pick_pack_cells(row, slot.order, pick_pack_lookup,
+                                         8 + int(i), "refresh")
+            if row_cells:
+                stats["refreshed_rows"] += 1
+                stats["refresh_cells"] += len(row_cells)
+                writes.extend(row_cells)
             continue
 
         sale = lines.loc[line_id]
@@ -1599,14 +1723,8 @@ def plan_existing_writes(existing_df, slots, lines, pick_pack_lookup, warehouse_
             if value is not None and value_found(value) and not value_found(row[column]):
                 row_cells.append((sheet_row, column, value, reason))
 
-        pick = pick_pack_lookup.get(normalize_value(sale["Order No"]))
-        if pick:
-            if pick["Pick Date"] is not None and not pd.isna(pick["Pick Date"]) \
-                    and not value_found(row["Actual.1"]):
-                row_cells.append((sheet_row, "Actual.1",
-                                  pd.Timestamp(pick["Pick Date"]).to_pydatetime(), reason))
-            if value_found(pick["Pick User"]) and not value_found(row["Warehouse Team"]):
-                row_cells.append((sheet_row, "Warehouse Team", pick["Pick User"], reason))
+        row_cells += _pick_pack_cells(row, normalize_value(sale["Order No"]),
+                                      pick_pack_lookup, sheet_row, reason)
 
         current_as = row["Dispatched Qty"]
         try:
@@ -1800,13 +1918,19 @@ FILL_RATE_COLUMNS = ["Order No", "Team", "Actual", "Warehouse Team", "Actual.1",
                      "Delivered Date", "Invoice No", "Warehouse", "Invoice Amount"]
 
 
-def _print_fill_rates(existing_df):
-    """READ-ONLY. Filled cells per column and form month on open (not closed) rows."""
+def _print_fill_rates(existing_df, writes=None):
+    """READ-ONLY. Filled cells per column and form month on open (not closed) rows.
+    With writes, the table is the PROJECTION after this run's fills/refreshes."""
     closed = existing_df.apply(row_is_closed, axis=1)
+    if writes is not None:
+        existing_df = existing_df.copy()
+        for sheet_row, column, value, _ in writes:
+            existing_df.at[sheet_row - 8, column] = value
     open_rows = existing_df[~closed]
     months = open_rows["Form Received Time"].map(_month_of)
-    print("\nFill rate on open rows (filled / rows) by form month; closed rows: "
-          f"{int(closed.sum()):,}")
+    title = ("PROJECTED fill rate on open rows after this run's fills/refreshes"
+             if writes is not None else "Fill rate on open rows (filled / rows) by form month")
+    print(f"\n{title}; closed rows: {int(closed.sum()):,}")
     header = f"{'month':<8}{'rows':>6} " + " ".join(f"{backfill_a1(8, c).split('!')[1][:-1]:>5}"
                                                   for c in FILL_RATE_COLUMNS)
     print(header)
@@ -1958,6 +2082,7 @@ def main():
                                  path=os.path.join("reports", "unmatched_rows.csv"))
 
     _print_fill_rates(existing_full_flow_df)
+    _print_fill_rates(existing_full_flow_df, writes=writes)
 
     report_suspect_cancellations(
         existing_full_flow_df, sales_lines,
