@@ -2188,6 +2188,93 @@ def report_suspect_cancellations(existing_df, sales_lines, path=None):
     return report
 
 
+_GT_REF = re.compile(r"^GT\d")
+_ORDER_TOKEN = re.compile(r"[A-Z0-9]+")
+
+
+def report_vinculum_gt_orders_not_in_full_flow(oe_orders, sales_lines, existing_df, fms_df,
+                                               path=None):
+    """READ-ONLY (2026-10-12). Every LIVE Vinculum GT order (daily Order Enquiry, not
+    Cancelled, + Sales Master = invoiced) that Full Flow does not show, by reason:
+      gt_missing        the GT (exact, else R/T/F base) is in neither Full Flow nor GT Pull
+                        FMS — the order was punched for a GT the pipeline never received
+                        (e.g. its lines were removed from GT Master "Orders" before GT Pull
+                        copied them). Nothing in this job can add it: restore the lines
+                        upstream (GT Pull), then the normal append picks them up.
+      appending_tonight the GT is in GT Pull FMS but not yet in Full Flow (this run appends)
+      order_not_shown   the GT is in Full Flow, but this Order No is in no row's P (a GT
+                        split over several Vinculum orders: P is per SKU line and is filled
+                        from the invoice, or from Order Enquiry only when the GT has ONE
+                        live order — the other orders stay invisible until invoiced)
+    This is the check Ops do by hand ("GT orders missing from the Full Flow FMS, status not
+    cancelled"). See "Errors and their fixes/2026-10-12-live-vinculum-gt-orders-missing-
+    from-full-flow.md"."""
+    orders = {}
+    oe = oe_orders if oe_orders is not None else prepare_oe_orders(None)
+    for r in oe.to_dict("records"):
+        if r["_CANCELLED"] or not _GT_REF.match(r["_GT"] or ""):
+            continue
+        orders[r["_ORDER"]] = {"order_no": r["Order No"], "ext_order_no": r["ExtOrderNo"],
+                               "gt": r["_GT"], "base": r["_GT_BASE"], "status": r["Status"],
+                               "order_date": r["Order Date"], "source": "order_enquiry"}
+    cancelled = set(oe.loc[oe["_CANCELLED"], "_ORDER"]) if len(oe) else set()
+    for r in sales_lines[["_ORDER", "_GT", "_GT_BASE", "Order No", "ExtOrderNo",
+                          "Order Date"]].to_dict("records"):
+        order = r["_ORDER"]
+        if not order or order in cancelled or not _GT_REF.match(r["_GT"] or ""):
+            continue
+        if order in orders:
+            orders[order]["source"] = "order_enquiry+sales_master"
+        else:
+            orders[order] = {"order_no": r["Order No"], "ext_order_no": r["ExtOrderNo"],
+                             "gt": r["_GT"], "base": r["_GT_BASE"], "status": "invoiced",
+                             "order_date": r["Order Date"], "source": "sales_master"}
+
+    def gt_sets(df):
+        gts = set(df["GT Number"].map(normalize_value)) - {""} if len(df) else set()
+        return gts, {gt_base(g) for g in gts}
+
+    ff_gts, ff_bases = gt_sets(existing_df)
+    fms_gts, fms_bases = gt_sets(fms_df)
+    ff_orders = set()
+    for p in (existing_df["Order No"] if len(existing_df) else []):
+        ff_orders.update(_ORDER_TOKEN.findall(normalize_value(p)))
+
+    rows = []
+    for order, o in orders.items():
+        if o["gt"] in ff_gts or o["base"] in ff_bases:
+            if order in ff_orders:
+                continue
+            reason = "order_not_shown"
+        elif o["gt"] in fms_gts or o["base"] in fms_bases:
+            reason = "appending_tonight"
+        else:
+            reason = "gt_missing"
+        rows.append({"reason": reason, **o})
+    report = pd.DataFrame(rows, columns=["reason", "order_no", "ext_order_no", "gt", "base",
+                                         "status", "order_date", "source"])
+    if len(report):
+        report = report.sort_values(["reason", "base", "order_no"]).reset_index(drop=True)
+
+    print("\n" + "=" * 80)
+    print("REPORT: live Vinculum GT orders NOT shown in Full Flow (read-only)")
+    print("=" * 80)
+    print(f"Live Vinculum GT orders (Order Enquiry + Sales Master): {len(orders):,}")
+    for reason in ("gt_missing", "appending_tonight", "order_not_shown"):
+        part = report[report["reason"] == reason]
+        print(f"  {reason:<18} orders {len(part):,}  GTs {part['ext_order_no'].nunique():,}")
+    missing = report[report["reason"] == "gt_missing"]
+    if len(missing):
+        print("  GTs punched in Vinculum but never received by Full Flow (restore upstream):")
+        for ext, part in missing.groupby("ext_order_no", sort=True):
+            print(f"    {ext}: {', '.join(f'{o} ({s})' for o, s in zip(part['order_no'], part['status']))}")
+    if path:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        report.to_csv(path, index=False)
+        print(f"Full list written to {path} (workflow artifact 'fullflow-reports').")
+    return report
+
+
 # Unmatched-row reasons (unmatched_rows.csv "reason"), from the Sales Master (invoiced
 # lines) and the daily Order Enquiry (punched orders, order-level):
 UNMATCHED_REASONS = {
@@ -2515,6 +2602,10 @@ def main():
     report_suspect_cancellations(
         existing_full_flow_df, sales_lines,
         path=os.path.join("reports", "suspect_cancellations.csv"))
+
+    report_vinculum_gt_orders_not_in_full_flow(
+        oe_orders, sales_lines, existing_full_flow_df, fms_df,
+        path=os.path.join("reports", "vinculum_gt_orders_not_in_full_flow.csv"))
 
     # --------------------------------------------------------
     # BUILD ROWS TO APPEND
