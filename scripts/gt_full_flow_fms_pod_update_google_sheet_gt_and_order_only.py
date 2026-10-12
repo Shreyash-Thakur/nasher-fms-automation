@@ -915,8 +915,9 @@ def find_pod(
         order_number
     )
 
-    # Both fields are mandatory.
-    if not gt or not order:
+    # Both fields are mandatory. "Cancelled" (and the other closed markers) in Order No
+    # is a sentinel written by the Full Flow job / GT_FMS, never an order number.
+    if not gt or not order or order.lower() in CLOSED_MARKERS:
         return None, ""
 
     gt_norm = normalize_gt(

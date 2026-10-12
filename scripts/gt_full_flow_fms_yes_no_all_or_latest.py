@@ -1661,6 +1661,9 @@ def build_full_flow(fms_df, assigned, pick_pack_lookup, warehouse_mapping, oe_re
 #    does not match, when the GT maps to exactly one live, un-invoiced Vinculum order
 #    (OrderEnquiryIndex). Q waits for the invoice (the export has no Created By). Record:
 #    "Errors and their fixes/2026-10-10-order-no-blank-until-invoiced.md".
+#  - 2026-10-12: P (Order No) reads "Cancelled" on rows whose status is Cancelled and whose
+#    P is blank (easy reference; a real Order No is kept); cleared again if the status is
+#    reverted. See plan_cancelled_order_no().
 #
 # BACKFILL_MODE env: "write" (default in CI), "dry-run" (log only, this script writes
 # NOTHING — no fills, no appends), "off" (no fills; appends as before).
@@ -1742,6 +1745,86 @@ def _row_marker(row):
         if value in CLOSED_MARKERS:
             return value
     return ""
+
+
+# ------------------------------------------------------------
+# "Cancelled" in Order No (P) for cancelled rows (2026-10-12, user request:
+# "mark order no as cancelled when status is cancelled for easy reference").
+# ------------------------------------------------------------
+# A row is "status Cancelled" when any of its status columns reads "Cancelled"
+# (trimmed, any case): T Status (stage 1) is the one every cancel path stamps — the
+# GT_FMS dashboard Cancel GT writes "Cancelled" into P:AW and the old historical
+# auto-cancel into T:AW — plus the later stage statuses and AJ Order Delivery Status
+# (the column the GT_FMS dashboards read as the line's status).
+#   mark : P blank + status Cancelled           -> P = "Cancelled" (blank cells only; a
+#          real Vinculum Order No is never replaced; such rows are closed, so the nightly
+#          fill never puts a number on them anyway).
+#   clear: P == "Cancelled" and "Cancelled" appears in NO other cell of J / P:AW
+#          (status reverted) -> P blank again, so the normal fill can run (same night).
+# "Cancelled" in P is a sentinel, never an order number: _Slot, OrderEnquiryIndex and
+# pod.py find_pod drop it (CLOSED_MARKERS) before any lookup.
+CANCELLED_ORDER_NO = "Cancelled"
+CANCELLED_STATUS_COLUMNS = ["Status", "Status.1", "Status.2", "Status.3", "Status.4",
+                            "Status.5", "Order Delivery Status"]          # T Y AC AH AM AQ AJ
+# Safety net: more clears than this in one night means something structural changed
+# (or humans use "Cancelled" in P alone as a cancel) -> clear nothing and say so.
+CANCELLED_ORDER_NO_CLEAR_MAX = 50
+
+
+def _is_cancelled_text(value):
+    if value is None:
+        return False
+    try:
+        if pd.isna(value):
+            return False
+    except (TypeError, ValueError):
+        pass
+    return str(value).replace("\xa0", " ").strip().lower() == "cancelled"
+
+
+def row_status_cancelled(row):
+    """True when any status column (CANCELLED_STATUS_COLUMNS) reads "Cancelled"."""
+    return any(_is_cancelled_text(row[c]) for c in CANCELLED_STATUS_COLUMNS if c in row.index)
+
+
+def _cancelled_outside_order_no(row):
+    """True when "Cancelled" is in J or anywhere in P:AW other than P itself."""
+    return any(_is_cancelled_text(row[c]) for c in CLOSED_MARKER_COLUMNS
+               if c != "Order No" and c in row.index)
+
+
+def plan_cancelled_order_no(existing_df):
+    """-> (marks, clears) for existing Full Flow rows; each a list of
+    (sheet_row, "Order No", value, reason) like plan_existing_writes' writes.
+    Idempotent: a marked row is neither marked nor cleared again."""
+    marks, clears = [], []
+    for i, row in existing_df.iterrows():
+        sheet_row = 8 + int(i)
+        order_no = row["Order No"]
+        if not value_found(order_no):
+            if row_status_cancelled(row):
+                marks.append((sheet_row, "Order No", CANCELLED_ORDER_NO, "cancel_mark"))
+        elif _is_cancelled_text(order_no) and not _cancelled_outside_order_no(row):
+            clears.append((sheet_row, "Order No", "", "cancel_clear"))
+    return marks, clears
+
+
+def merge_order_no_writes(writes, marks, clears):
+    """Add sentinel marks / clears to the fill plan; a fill of the same P cell (a genuine
+    Order No found tonight) wins. -> (writes, number of cleared rows filled tonight)."""
+    filled_p = {(r, c) for r, c, _, _ in writes if c == "Order No"}
+    extra = [w for w in marks + clears if (w[0], w[1]) not in filled_p]
+    return list(writes) + extra, sum(1 for w in clears if (w[0], w[1]) in filled_p)
+
+
+def apply_cancelled_order_no(df):
+    """Rows being appended: P blank + status Cancelled -> "Cancelled" (in place).
+    Returns the number of rows marked."""
+    if df is None or df.empty:
+        return 0
+    mask = df.apply(lambda r: not value_found(r["Order No"]) and row_status_cancelled(r), axis=1)
+    df.loc[mask, "Order No"] = CANCELLED_ORDER_NO
+    return int(mask.sum())
 
 
 def prepare_sales_lines(sales_df):
@@ -2313,6 +2396,33 @@ def main():
     fms_to_append = fms_df.loc[new_gt_mask | new_line_mask].copy()
 
     # --------------------------------------------------------
+    # "CANCELLED" SENTINEL IN ORDER NO (P) — plan before matching
+    # --------------------------------------------------------
+    # Clears are applied in memory first, so a row whose status was reverted is open
+    # and blank-P for tonight's fill; marks are added after the fill plan (blank P only).
+    order_no_marks, order_no_clears = plan_cancelled_order_no(existing_full_flow_df)
+    print("\n" + "=" * 80)
+    print('ORDER NO "Cancelled" FOR CANCELLED ROWS')
+    print("=" * 80)
+    print(f"Blank Order No + status Cancelled -> 'Cancelled': {len(order_no_marks):,}")
+    if order_no_marks:
+        months = pd.Series([_month_of(existing_full_flow_df.at[r - 8, "Form Received Time"])
+                            for r, *_ in order_no_marks]).value_counts().sort_index()
+        print("  by form month: " + ", ".join(f"{m} {c}" for m, c in months.items()))
+    print(f"Order No 'Cancelled' but status no longer Cancelled -> cleared: "
+          f"{len(order_no_clears):,}")
+    for r, *_ in order_no_clears[:15]:
+        row = existing_full_flow_df.loc[r - 8]
+        print(f"  clear: row {r} {row['GT Number']} / {row['Vinculum SKU']} "
+              f"(T {row['Status']!r}, AJ {row['Order Delivery Status']!r})")
+    if len(order_no_clears) > CANCELLED_ORDER_NO_CLEAR_MAX:
+        print(f"WARNING: more than {CANCELLED_ORDER_NO_CLEAR_MAX} rows would be cleared — "
+              f"clearing NONE tonight (check the samples above).")
+        order_no_clears = []
+    for r, *_ in order_no_clears:
+        existing_full_flow_df.at[r - 8, "Order No"] = ""
+
+    # --------------------------------------------------------
     # MATCH (existing rows + rows to append) AGAINST VINCULUM
     # --------------------------------------------------------
     slots = [_Slot("existing", i, row) for i, row in existing_full_flow_df.iterrows()]
@@ -2326,6 +2436,13 @@ def main():
     for s in new_slots:
         if not s.assigned:
             s.oe_order, s.oe_outcome = oe_index.match(s.gt, s.base)
+
+    # A genuine Order No found tonight wins over the sentinel (and over a clear).
+    writes, refilled = merge_order_no_writes(writes, order_no_marks, order_no_clears)
+    print(f'Order No sentinel writes tonight: "Cancelled" '
+          f'{sum(1 for w in writes if w[3] == "cancel_mark"):,} | cleared '
+          f'{sum(1 for w in writes if w[3] == "cancel_clear"):,} | cleared then filled '
+          f'from Vinculum {refilled:,}')
 
     print("\n" + "=" * 80)
     print(f"FILL + REFRESH EXISTING ROWS  —  mode: {BACKFILL_MODE}")
@@ -2407,6 +2524,8 @@ def main():
     new_full_flow_df = build_full_flow(fms_to_append, assigned, pick_pack_lookup,
                                        warehouse_mapping, oe_records) if len(fms_to_append) else \
         pd.DataFrame(columns=OUTPUT_COLUMNS)
+    new_marked = apply_cancelled_order_no(new_full_flow_df)
+    print(f"Rows to append with status Cancelled -> Order No 'Cancelled': {new_marked:,}")
 
     if dry_run:
         print("\nDRY RUN — nothing written (no fills, no refresh, no appends).")
