@@ -45,8 +45,28 @@
     GT Pull FMS; Sales Master not available locally):
     `Live Vinculum GT orders: 325` / `gt_missing orders 42 GTs 37` / `appending_tonight orders 0` /
     `order_not_shown orders 42 GTs 31`, followed by the per-GT list (`GT180926A20: N89578 (Allocated)` …).
-  - `find_new_fms_rows` on GT Pull FMS plus the 45 rows the GT_Pull backfill plans:
-    `after backfill: new-GT rows 45, GTs 36, new lines for existing GTs 0`.
+  - `find_new_fms_rows` on GT Pull FMS plus the rows the GT_Pull backfill plans (final allow-list, 38
+    GTs): `after backfill: new-GT rows 88, GTs 38, new lines for existing GTs 0`.
+  - **Live dry-run** run 38207695865 (workflow_dispatch, `backfill_mode=dry-run`, main @ 5e41646, Order
+    Enquiry plus the full-FY Sales Master). Before the run I checked that dry-run writes nothing: `main()`
+    returns before `write_cells` / `write_full_flow`, and the workflow skips POD and planned-status.
+    Output:
+    ```
+    Mode (BACKFILL_MODE):       dry-run
+    REPORT: live Vinculum GT orders NOT shown in Full Flow (read-only)
+    Live Vinculum GT orders (Order Enquiry + Sales Master): 1,039
+      gt_missing         orders 57  GTs 43
+      appending_tonight  orders 0  GTs 0
+      order_not_shown    orders 53  GTs 41
+    DRY RUN — nothing written (no fills, no refresh, no appends).
+    Would append 0 rows after row 8,299.
+    ```
+    The 43 missing GTs are:
+    - the 36 from the Order Enquiry window, plus GT220626A2 and GT230626A1 (invoiced, removed from
+      Orders, added to the GT_Pull backfill);
+    - GT110826A1V (Vinculum-only ref);
+    - GT310326A1/A2/A4 (FY 2025-26);
+    - GT080926A2_C.
 - **Blast radius:** read-only. It adds one CSV and a log section to the nightly run. No sheet writes and
   no change to matching, filling or appending.
 - **Still open:**
