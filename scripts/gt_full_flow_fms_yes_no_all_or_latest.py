@@ -565,6 +565,26 @@ def read_existing_full_flow():
     return existing_df
 
 
+def grid_row_count(current_rows, required_rows):
+    """Row count to set on the Full Flow grid: grow when needed, never shrink."""
+    return max(int(current_rows or 0), int(required_rows))
+
+
+def drop_rows_now_in_full_flow(new_df, fresh_existing_df):
+    """Rows to append minus those whose GT + Vinculum SKU reached Full Flow while this
+    job was running (GT Pull's realtime Apps Script appends approved lines within
+    ~1-2 min, 2026-10-12). Same exact normalised key as find_new_fms_rows.
+    -> (rows still to append, number dropped)."""
+    if new_df is None or new_df.empty or fresh_existing_df is None or fresh_existing_df.empty:
+        return new_df, 0
+    ff_keys = set(create_match_key(g, s) for g, s in
+                  zip(fresh_existing_df["GT Number"], fresh_existing_df["Vinculum SKU"]))
+    keep = [create_match_key(g, s) not in ff_keys
+            for g, s in zip(new_df["GT Number"], new_df["Vinculum SKU"])]
+    kept = new_df.loc[keep].reset_index(drop=True)
+    return kept, len(new_df) - len(kept)
+
+
 def write_full_flow(sheet_id, df, start_row=8):
     print(
         f"Writing Full Flow data to destination "
@@ -607,8 +627,12 @@ def write_full_flow(sheet_id, df, start_row=8):
         print("No new Full Flow rows to write.")
         return
 
-    # Expand the destination grid only when the new data requires it.
-    required_rows = start_row - 1 + len(values)
+    # Expand the destination grid only when the new data requires it. Never shrink it:
+    # GT Pull (Apps Script, 2026-10-12) appends rows in real time, and a rowCount
+    # below the sheet's current size would DELETE the rows past it.
+    current = get_sheet_by_title(OUTPUT_SPREADSHEET_ID, FULL_FLOW_SHEET_NAME) or {}
+    current_rows = int(current.get("gridProperties", {}).get("rowCount", 0) or 0)
+    required_rows = grid_row_count(current_rows, start_row - 1 + len(values))
     sheets_service.spreadsheets().batchUpdate(
         spreadsheetId=OUTPUT_SPREADSHEET_ID,
         body={
@@ -2636,7 +2660,17 @@ def main():
         print("\nNothing to append.")
         return
 
-    existing_row_count = len(existing_full_flow_df)
+    # GT Pull (Apps Script) appends approved lines to Full Flow in real time, so the
+    # sheet may have grown since it was read above: re-read it right before appending,
+    # skip lines that arrived meanwhile and append after the CURRENT last row.
+    fresh_full_flow_df = read_existing_full_flow()
+    new_full_flow_df, arrived = drop_rows_now_in_full_flow(new_full_flow_df, fresh_full_flow_df)
+    print(f"Rows appended to Full Flow by GT Pull (realtime) during this run, skipped: {arrived:,}")
+    if new_full_flow_df.empty:
+        print("\nNothing to append.")
+        return
+
+    existing_row_count = len(fresh_full_flow_df)
     write_full_flow(output_sheet_id, new_full_flow_df, start_row=8 + existing_row_count)
 
     print("\n" + "=" * 80)
