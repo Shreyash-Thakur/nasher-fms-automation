@@ -2,9 +2,12 @@ import io
 import json
 import base64
 import os
+import random
 import re
+import sys
+import time
 import warnings
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
@@ -56,6 +59,18 @@ PICK_PACK_FOLDER_ID = "1Xi66o4A0I3GdtlNrh61XcEWNkT5UKmey"
 # Master" (Sales Report = invoiced lines only). See read_order_enquiry_daily_files().
 ORDER_ENQUIRY_DAILY_FOLDER_ID = "1rinwTyd3BseS7o_FHP4Y907egQz39zBO"
 ORDER_ENQUIRY_DAILY_PREFIX = "orderenquiry_"   # compared lower-case; monthly dumps are ignored
+
+# Daily Vinculum Sales Report files ("VIN-RETAIL", one Google Sheet per INVOICE date named
+# DD.MM.YYYY, tab "Sales Report"), written ~15:30-17:00 IST the next day by
+# nasher-miles-report-automation vinculum-sales-report.yml. Apps Script
+# VinculumSalesReportConsolidate copies them into the Sales Master above, but only on its
+# next daily trigger, so reading the Sales Master alone added a day before an invoice
+# reached Full Flow. The last SALES_DAILY_LOOKBACK_DAYS files are read directly and their
+# lines that are not in the Sales Master yet are used too (2026-10-13; record
+# "Errors and their fixes/2026-10-13-full-flow-data-older-than-24h.md").
+SALES_DAILY_FOLDER_ID = "1iL94fl0nUOxZ_pEWH_AuxnqBYsYjsjt_"
+SALES_DAILY_LOOKBACK_DAYS = 7
+SALES_DAILY_TAB_PREFIX = "daily:"
 
 # ------------------------------------------------------------
 # ONE-TIME HISTORICAL CANCELLATION LOGIC
@@ -264,6 +279,53 @@ sheets_service = build("sheets", "v4", credentials=creds, cache_discovery=False)
 # GOOGLE DRIVE HELPERS
 # ============================================================
 
+# ------------------------------------------------------------
+# Drive rate limits (2026-10-13). One night skipped a Pick Pack file on
+# "HttpError 403 ... userRateLimitExceeded" and the run stayed green. Exports are now
+# retried with backoff; a file that still cannot be read is recorded in RUN_HEALTH
+# (job summary + non-zero "skipped") and fails the run if it is recent.
+# ------------------------------------------------------------
+DRIVE_RETRY_DELAYS = (2, 4, 8, 16, 32)          # seconds (+ up to 1 s jitter)
+_RETRY_HTTP_STATUSES = {429, 500, 502, 503, 504}
+_RATE_LIMIT_REASONS = ("userRateLimitExceeded", "rateLimitExceeded", "backendError",
+                       "internalError", "Rate Limit Exceeded", "User rate limit exceeded")
+
+
+def _http_status(exc):
+    try:
+        return int(getattr(getattr(exc, "resp", None), "status", None))
+    except (TypeError, ValueError):
+        return None
+
+
+def is_retryable_drive_error(exc):
+    """429 / 5xx, or a 403 whose reason is a rate limit (a 403 for a missing permission
+    is NOT retried - waiting cannot fix it)."""
+    status = _http_status(exc)
+    if status in _RETRY_HTTP_STATUSES:
+        return True
+    if status == 403:
+        text = f"{exc} {getattr(exc, 'content', b'')!r}"
+        return any(reason in text for reason in _RATE_LIMIT_REASONS)
+    return False
+
+
+def with_drive_backoff(call, what, delays=DRIVE_RETRY_DELAYS, sleep=None):
+    """call() with retries on Drive rate-limit / transient errors; other errors and the
+    last failure are raised to the caller."""
+    sleep = sleep or time.sleep
+    for attempt in range(len(delays) + 1):
+        try:
+            return call()
+        except Exception as exc:
+            if attempt >= len(delays) or not is_retryable_drive_error(exc):
+                raise
+            wait = delays[attempt] + random.random()
+            print(f"  Drive {_http_status(exc)} (rate limit / transient) on {what} - "
+                  f"retry {attempt + 1}/{len(delays)} in {wait:.0f}s")
+            sleep(wait)
+
+
 def list_drive_files(folder_id, extension=None):
     query = (
         f"'{folder_id}' in parents "
@@ -286,7 +348,7 @@ def list_drive_files(folder_id, extension=None):
             orderBy="modifiedTime desc",
             supportsAllDrives=True,
             includeItemsFromAllDrives=True,
-        ).execute()
+        ).execute(num_retries=5)
 
         files.extend(response.get("files", []))
         page_token = response.get("nextPageToken")
@@ -300,13 +362,17 @@ def list_drive_files(folder_id, extension=None):
 
 
 def download_drive_file(file_id):
-    return _download_request(drive_service.files().get_media(fileId=file_id))
+    return with_drive_backoff(
+        lambda: _download_request(drive_service.files().get_media(fileId=file_id)),
+        f"download {file_id}")
 
 
 def export_drive_file(file_id, mime_type):
     """Native Google file (e.g. a Google Sheet) exported to mime_type."""
-    return _download_request(
-        drive_service.files().export_media(fileId=file_id, mimeType=mime_type))
+    return with_drive_backoff(
+        lambda: _download_request(
+            drive_service.files().export_media(fileId=file_id, mimeType=mime_type)),
+        f"export {file_id}")
 
 
 def _download_request(request):
@@ -319,6 +385,141 @@ def _download_request(request):
 
     buffer.seek(0)
     return buffer
+
+
+# ============================================================
+# RUN HEALTH: per-source counts, skipped files, freshness (2026-10-13)
+# ============================================================
+# Written to the log, to the GitHub job summary ($GITHUB_STEP_SUMMARY) and as
+# ::warning:: / ::error:: annotations. The process exits 1 (after all writes) when a
+# file whose report date is within RECENT_SKIP_FAIL_DAYS could not be read - an
+# unreadable file used to leave the run green while its day silently went missing.
+
+IST = timezone(timedelta(hours=5, minutes=30))
+RECENT_SKIP_FAIL_DAYS = 3        # skipped file dated today-3 .. today -> run fails
+STALE_AFTER_DAYS = 2             # newest daily file older than today-2 -> warning
+
+_NAME_DATE_PATTERNS = (
+    (re.compile(r"(?<!\d)(\d{2})[.-](\d{2})[.-](\d{4})(?!\d)"), "dmy"),
+    (re.compile(r"(?<!\d)(\d{4})-(\d{2})-(\d{2})(?!\d)"), "ymd"),
+)
+
+
+def today_ist():
+    return datetime.now(IST).date()
+
+
+def file_report_date(name):
+    """Latest date written in a report file name ("PickPackReport_10.10.2026",
+    "OrderEnquiry_10-10-2026", "10.10.2026", "..._2026-04-01_to_2026-04-03"), or None."""
+    found = []
+    for pattern, order in _NAME_DATE_PATTERNS:
+        for m in pattern.finditer(str(name or "")):
+            a, b, c = (int(x) for x in m.groups())
+            day, month, year = (a, b, c) if order == "dmy" else (c, b, a)
+            try:
+                found.append(datetime(year, month, day).date())
+            except ValueError:
+                pass
+    return max(found) if found else None
+
+
+class RunHealth:
+    """What each source delivered this run. Sources: a short key + a label."""
+
+    def __init__(self):
+        self.sources = {}
+
+    def source(self, key, label, daily=True):
+        return self.sources.setdefault(key, {
+            "label": label, "daily": daily, "found": 0, "read": 0, "rows": 0,
+            "skipped": [], "newest": None, "note": ""})
+
+    def _src(self, key):
+        return self.sources.get(key) or self.source(key, key)
+
+    def found(self, key, count):
+        self._src(key)["found"] = count
+
+    def read(self, key, name, rows):
+        src = self._src(key)
+        src["read"] += 1
+        src["rows"] += int(rows)
+        day = file_report_date(name)
+        if day and (src["newest"] is None or day > src["newest"]):
+            src["newest"] = day
+
+    def skipped(self, key, name, reason):
+        self._src(key)["skipped"].append((str(name), str(reason)[:300]))
+
+    def note(self, key, text):
+        self._src(key)["note"] = text
+
+    def problems(self, today):
+        """(errors, warnings): recent skipped files are errors; older skips, a stale
+        or empty daily source are warnings."""
+        errors, warns = [], []
+        for src in self.sources.values():
+            for name, reason in src["skipped"]:
+                day = file_report_date(name)
+                msg = f"{src['label']}: file not read, skipped: {name} -> {reason}"
+                if day is not None and (today - day).days <= RECENT_SKIP_FAIL_DAYS:
+                    errors.append(msg)
+                else:
+                    warns.append(msg)
+            if not src["daily"]:
+                continue
+            if src["newest"] is None:
+                warns.append(f"{src['label']}: no dated file read this run")
+            elif (today - src["newest"]).days > STALE_AFTER_DAYS:
+                warns.append(f"{src['label']}: newest file is {src['newest']:%d.%m.%Y} "
+                             f"({(today - src['newest']).days} days old) - the Vinculum export "
+                             f"job is not delivering (check nasher-miles-report-automation)")
+        return errors, warns
+
+    def summary_markdown(self, today):
+        lines = ["### Full Flow sources", "",
+                 "| Source | Files found | Read | Skipped | Rows | Newest file | Note |",
+                 "|---|---:|---:|---:|---:|---|---|"]
+        for src in self.sources.values():
+            newest = f"{src['newest']:%d.%m.%Y}" if src["newest"] else "-"
+            lines.append(f"| {src['label']} | {src['found']:,} | {src['read']:,} | "
+                         f"{len(src['skipped']):,} | {src['rows']:,} | {newest} | {src['note']} |")
+        errors, warns = self.problems(today)
+        if errors or warns:
+            lines += ["", "**Problems**", ""]
+            lines += [f"- ERROR: {m}" for m in errors] + [f"- WARNING: {m}" for m in warns]
+        return "\n".join(lines) + "\n"
+
+    def finish(self, today=None, summary_path=None):
+        """Print + publish; returns the process exit code (1 if any recent file was
+        skipped)."""
+        today = today or today_ist()
+        errors, warns = self.problems(today)
+        text = self.summary_markdown(today)
+        print("\n" + "=" * 80)
+        print("RUN HEALTH (sources read this run)")
+        print("=" * 80)
+        print(text)
+        for m in warns:
+            print(f"::warning::{m}")
+        for m in errors:
+            print(f"::error::{m}")
+        summary_path = summary_path or os.environ.get("GITHUB_STEP_SUMMARY")
+        if summary_path:
+            try:
+                with open(summary_path, "a", encoding="utf-8") as f:
+                    f.write(text)
+            except OSError as exc:
+                print(f"WARNING: job summary not written: {exc}")
+        if errors:
+            print(f"FAILING the run: {len(errors)} recent file(s) could not be read "
+                  f"(all fills/appends above were still written).")
+            return 1
+        return 0
+
+
+RUN_HEALTH = RunHealth()
 
 
 # ============================================================
@@ -958,6 +1159,8 @@ def read_sales_file():
     added in the future. If a list is provided, only those exact tab names are read.
     """
     tab_names = get_order_enquiry_tab_names()
+    RUN_HEALTH.source("sales_master", "Sales Master (Q/AS/AW-AY)", daily=False)
+    RUN_HEALTH.found("sales_master", len(tab_names))
 
     print("\n" + "=" * 80)
     print("ORDER ENQUIRY SOURCE")
@@ -1002,11 +1205,13 @@ def read_sales_file():
             df["_TAB"] = tab_name   # used to drop rows duplicated across month tabs
             sales_dataframes.append(df)
             included_tabs.append(tab_name)
+            RUN_HEALTH.read("sales_master", tab_name, len(df))
             print(f"  INCLUDED - {len(df):,} rows")
 
         except Exception as exc:
             print(f"  ERROR reading tab '{tab_name}': {exc}")
             skipped_tabs.append(tab_name)
+            RUN_HEALTH.skipped("sales_master", tab_name, f"{type(exc).__name__}: {exc}")
 
     if not sales_dataframes:
         raise ValueError(
@@ -1038,6 +1243,106 @@ def read_sales_file():
             print(f"  ✗ {name}")
 
     return sales_df
+
+
+_SALES_DAILY_NAME = re.compile(r"^\s*(\d{2})\.(\d{2})\.(\d{4})\s*$")
+
+
+def sales_daily_candidates(files, today, lookback_days=SALES_DAILY_LOOKBACK_DAYS):
+    """Daily Sales Report files ("DD.MM.YYYY" = invoice date) dated today-lookback ..
+    today, oldest first. Other names (monthly dumps, copies) are ignored."""
+    out = []
+    for f in files:
+        m = _SALES_DAILY_NAME.match(str(f.get("name", "")))
+        if not m:
+            continue
+        try:
+            day = datetime(int(m.group(3)), int(m.group(2)), int(m.group(1))).date()
+        except ValueError:
+            continue
+        if 0 <= (today - day).days <= lookback_days:
+            out.append((day, f))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def _read_sales_daily_sheet(file_info):
+    """One daily Sales Report file -> DataFrame with SALES_REQUIRED_COLUMNS (or the first
+    tab's columns, so the caller can report what is missing). A Google Sheet is read via
+    the Sheets API exactly like the Sales Master tabs (same value rendering)."""
+    if file_info.get("mimeType") == GOOGLE_SHEET_MIME:
+        meta = with_drive_backoff(
+            lambda: sheets_service.spreadsheets().get(
+                spreadsheetId=file_info["id"], fields="sheets.properties.title").execute(),
+            f"tabs of {file_info.get('name')}")
+        titles = [sh["properties"]["title"] for sh in meta.get("sheets", [])]
+        titles.sort(key=lambda t: 0 if t.strip().lower() == "sales report" else 1)
+        first = None
+        for title in titles:
+            df = with_drive_backoff(lambda: read_order_enquiry_tab(file_info["id"], title),
+                                    f"{file_info.get('name')} / {title}")
+            if first is None:
+                first = df
+            if all(c in df.columns for c in SALES_REQUIRED_COLUMNS):
+                return df
+        return first if first is not None else pd.DataFrame()
+    raw = download_drive_file(file_info["id"]).getvalue()
+    if _pick_pack_kind(file_info) == "csv":
+        df = _read_pick_pack_csv(raw)
+        df.columns = [normalize_sales_header(c) for c in df.columns]
+        return df
+    return _read_workbook_tabs(raw, SALES_REQUIRED_COLUMNS, rename=normalize_sales_header)
+
+
+def read_sales_daily_files(today=None):
+    """Daily Vinculum Sales Report files of the last SALES_DAILY_LOOKBACK_DAYS days
+    (folder SALES_DAILY_FOLDER_ID). Rows get _TAB = "daily:<file name>";
+    prepare_sales_lines keeps only the lines the Sales Master does not have yet.
+    Never fatal: an unreadable folder / file is reported and skipped."""
+    today = today or today_ist()
+    print("\nLooking for daily Sales Report files (DD.MM.YYYY, last "
+          f"{SALES_DAILY_LOOKBACK_DAYS} days) in Google Drive...")
+    RUN_HEALTH.source("sales_daily", "Sales Report daily (invoices before consolidation)")
+    empty = pd.DataFrame(columns=SALES_REQUIRED_COLUMNS + ["_TAB"])
+    try:
+        files = list_drive_files(SALES_DAILY_FOLDER_ID)
+    except Exception as exc:
+        print(f"WARNING: Sales Report folder not listable -> {type(exc).__name__}: {exc}. "
+              f"Invoices come from the Sales Master only this run.")
+        RUN_HEALTH.note("sales_daily", f"folder not listable: {type(exc).__name__}")
+        return empty
+    candidates = sales_daily_candidates(files, today)
+    RUN_HEALTH.found("sales_daily", len(candidates))
+    print(f"Sales Report daily files in window: {len(candidates):,} "
+          f"(folder has {len(files):,} files)")
+    if not files:
+        print("WARNING: Sales Report folder is empty or not shared with this service "
+              "account - share it (Viewer) so invoices reach Full Flow a day earlier.")
+        RUN_HEALTH.note("sales_daily", "folder empty / not shared with the service account")
+
+    frames = []
+    for day, file_info in candidates:
+        name = file_info.get("name", file_info.get("id"))
+        try:
+            df = _read_sales_daily_sheet(file_info)
+        except Exception as exc:
+            print(f"WARNING: Sales Report file not readable, skipped: {name} "
+                  f"-> {type(exc).__name__}: {exc}")
+            RUN_HEALTH.skipped("sales_daily", name, f"{type(exc).__name__}: {exc}")
+            continue
+        missing = [c for c in SALES_REQUIRED_COLUMNS if c not in df.columns]
+        if missing:
+            print(f"WARNING: Sales Report file skipped, missing columns {missing}: {name}")
+            RUN_HEALTH.skipped("sales_daily", name, f"missing columns {missing}")
+            continue
+        df = df.dropna(how="all").copy()
+        df["_TAB"] = SALES_DAILY_TAB_PREFIX + str(name).strip()
+        frames.append(df)
+        RUN_HEALTH.read("sales_daily", name, len(df))
+        print(f"Read: {name} -> {len(df):,} rows")
+    if not frames:
+        return empty
+    return pd.concat(frames, ignore_index=True)
 
 
 # Pick Pack file kinds. 2026-10-10: since May 2026 the daily reports arrive in the folder
@@ -1122,6 +1427,8 @@ def read_pick_pack_files():
     candidates = [(f, kind) for f, kind in candidates if kind]
     by_kind = {k: sum(1 for _, kind in candidates if kind == k) for k in ("csv", "gsheet", "xlsx")}
 
+    RUN_HEALTH.source("pick_pack", "Pick Pack (V/X)")
+    RUN_HEALTH.found("pick_pack", len(candidates))
     print(f"Pick Pack files found: {len(candidates):,}  (csv {by_kind['csv']} | "
           f"google sheet {by_kind['gsheet']} | xlsx {by_kind['xlsx']}); "
           f"other files ignored: {len(ignored)}")
@@ -1144,6 +1451,7 @@ def read_pick_pack_files():
             print(f"WARNING: Pick Pack file not readable, skipped: {name} [{kind}] "
                   f"-> {type(exc).__name__}: {exc}")
             skipped.append(name)
+            RUN_HEALTH.skipped("pick_pack", name, f"{type(exc).__name__}: {exc}")
             continue
 
         missing = [c for c in PICK_PACK_REQUIRED_COLUMNS if c not in df.columns]
@@ -1151,10 +1459,12 @@ def read_pick_pack_files():
             print(f"WARNING: Pick Pack file skipped, missing columns {missing}: {name} [{kind}] "
                   f"(has: {list(df.columns)[:12]})")
             skipped.append(name)
+            RUN_HEALTH.skipped("pick_pack", name, f"missing columns {missing}")
             continue
 
         df = df.dropna(how="all")
         dataframes.append(df)
+        RUN_HEALTH.read("pick_pack", name, len(df))
         print(f"Read: {name} [{kind}] -> {len(df):,} rows")
 
     if skipped:
@@ -1189,16 +1499,19 @@ def read_order_enquiry_daily_files():
     (0 = most recently modified; the Drive listing is modifiedTime desc)."""
     print("\nLooking for daily Order Enquiry files (OrderEnquiry_DD-MM-YYYY) in Google Drive...")
     empty = pd.DataFrame(columns=OE_REQUIRED_COLUMNS + ["_FILE", "_FILE_RANK"])
+    RUN_HEALTH.source("order_enquiry", "Order Enquiry daily (P/S)")
     try:
         files = list_drive_files(ORDER_ENQUIRY_DAILY_FOLDER_ID)
     except Exception as exc:
         print(f"WARNING: Order Enquiry folder not listable -> {type(exc).__name__}: {exc}. "
               f"P/S fill from Order Enquiry skipped this run.")
+        RUN_HEALTH.note("order_enquiry", f"folder not listable: {type(exc).__name__}")
         return empty
     named = [f for f in files
              if str(f.get("name", "")).strip().lower().startswith(ORDER_ENQUIRY_DAILY_PREFIX)]
     candidates = [(f, _pick_pack_kind(f)) for f in named]
     candidates = [(f, kind) for f, kind in candidates if kind]
+    RUN_HEALTH.found("order_enquiry", len(candidates))
     print(f"Order Enquiry daily files found: {len(candidates):,}; "
           f"other files in the folder ignored: {len(files) - len(candidates):,}")
 
@@ -1217,17 +1530,20 @@ def read_order_enquiry_daily_files():
             print(f"WARNING: Order Enquiry file not readable, skipped: {name} [{kind}] "
                   f"-> {type(exc).__name__}: {exc}")
             skipped.append(name)
+            RUN_HEALTH.skipped("order_enquiry", name, f"{type(exc).__name__}: {exc}")
             continue
         missing = [c for c in OE_REQUIRED_COLUMNS if c not in df.columns]
         if missing:
             print(f"WARNING: Order Enquiry file skipped, missing columns {missing}: {name} "
                   f"[{kind}] (has: {list(df.columns)[:12]})")
             skipped.append(name)
+            RUN_HEALTH.skipped("order_enquiry", name, f"missing columns {missing}")
             continue
         df = df.dropna(how="all").copy()
         df["_FILE"] = name
         df["_FILE_RANK"] = rank
         frames.append(df)
+        RUN_HEALTH.read("order_enquiry", name, len(df))
         print(f"Read: {name} [{kind}] -> {len(df):,} rows")
 
     if skipped:
@@ -1866,6 +2182,34 @@ def prepare_sales_lines(sales_df):
         sales_df["_SKU_ALT"] = ""
     sales_df["_ORDER"] = sales_df["Order No"].map(normalize_value)
 
+    # Daily Sales Report rows (read_sales_daily_files): keep only lines the Sales Master
+    # does not hold yet (same Order No + GT + SKU + Invoice No). They are kept out of
+    # the cross-tab de-duplication below, which ignores Invoice No and would otherwise
+    # drop a second (split) shipment of a line invoiced on another day.
+    daily = pd.DataFrame(columns=sales_df.columns)
+    if "_TAB" in sales_df.columns and len(sales_df):
+        is_daily = sales_df["_TAB"].astype(str).str.startswith(SALES_DAILY_TAB_PREFIX)
+        if is_daily.any():
+            daily = sales_df[is_daily].copy()
+            sales_df = sales_df[~is_daily].reset_index(drop=True)
+
+            def line_keys(frame):
+                return list(zip(frame["_ORDER"], frame["_GT"], frame["_SKU"],
+                                frame["Invoice No"].map(normalize_value)))
+
+            master_keys = set(line_keys(sales_df))
+            daily_keys = line_keys(daily)
+            new_mask, seen = [], set()
+            for key in daily_keys:
+                new_mask.append(key not in master_keys and key not in seen)
+                seen.add(key)
+            read_n = len(daily)
+            daily = daily[new_mask]
+            print(f"Sales Report daily lines: {read_n:,} read, {read_n - len(daily):,} already "
+                  f"in the Sales Master, {len(daily):,} used (not consolidated yet)")
+            if len(daily):
+                RUN_HEALTH.note("sales_daily", f"{len(daily):,} lines not yet in the Sales Master")
+
     before = len(sales_df)
     if "_TAB" in sales_df.columns and before:
         # The same Vinculum line exported into two month tabs (e.g. "Sep-26" and
@@ -1884,6 +2228,8 @@ def prepare_sales_lines(sales_df):
         sales_df = sales_df.reset_index(drop=True)
     print(f"Order Enquiry lines: {before:,} -> {len(sales_df):,} after dropping "
           f"cross-tab duplicates ({before - len(sales_df):,} dropped)")
+    if len(daily):
+        sales_df = pd.concat([sales_df, daily], ignore_index=True)
     return sales_df
 
 
@@ -2457,6 +2803,8 @@ def main():
     print(f"Order Enquiry tabs config:  {ORDER_ENQUIRY_SHEET_NAMES if ORDER_ENQUIRY_SHEET_NAMES else 'ALL TABS'}")
     print(f"Pick Pack folder ID:        {PICK_PACK_FOLDER_ID}")
     print(f"Order Enquiry daily folder: {ORDER_ENQUIRY_DAILY_FOLDER_ID}")
+    print(f"Sales Report daily folder:  {SALES_DAILY_FOLDER_ID} "
+          f"(last {SALES_DAILY_LOOKBACK_DAYS} days)")
     print(f"Mode (BACKFILL_MODE):       {BACKFILL_MODE}")
     if BACKFILL_MODE not in ("write", "dry-run", "off"):
         raise SystemExit(f"Unknown BACKFILL_MODE {BACKFILL_MODE!r} (write / dry-run / off)")
@@ -2467,6 +2815,9 @@ def main():
     # --------------------------------------------------------
     fms_df = read_fms_sheet()
     sales_df = read_sales_file()
+    sales_daily_df = read_sales_daily_files()
+    if not sales_daily_df.empty:
+        sales_df = pd.concat([sales_df, sales_daily_df], ignore_index=True)
     pick_pack_df = read_pick_pack_files()
     oe_daily_df = read_order_enquiry_daily_files()
     warehouse_mapping = read_warehouse_mapping()
@@ -2684,3 +3035,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # Exit 1 (after everything was written) if a recent source file could not be read.
+    sys.exit(RUN_HEALTH.finish())

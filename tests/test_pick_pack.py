@@ -51,7 +51,7 @@ class _FakeList:
     def list(self, **kwargs):
         self.calls.append(kwargs.get("pageToken"))
         page = self.pages[kwargs.get("pageToken")]
-        return type("Req", (), {"execute": lambda _self: page})()
+        return type("Req", (), {"execute": lambda _self, **kwargs: page})()
 
 
 class _FakeDrive:

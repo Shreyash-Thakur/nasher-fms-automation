@@ -2,7 +2,12 @@ name: GT FMS Automation
 
 on:
   schedule:
-    - cron: '30 19 * * *'   # daily at 1:00 AM IST (19:30 UTC)
+    # GitHub starts scheduled runs late (observed 3-6 h), so the times below are the
+    # EARLIEST start. Two runs a day keep Full Flow within ~a day of Vinculum:
+    - cron: '30 19 * * *'   # nightly, 01:00 IST (really ~04:00-07:00 IST)
+    - cron: '47 12 * * *'   # evening, 18:17 IST: picks up the day's Vinculum files
+                            # (Pick Pack / Sales / Order Enquiry land ~15:30-17:00 IST)
+                            # the same day instead of the next morning. 2026-10-13.
   workflow_dispatch:          # keeps the manual "Run workflow" button too
     inputs:
       backfill_mode:
@@ -15,9 +20,16 @@ on:
         type: choice
         options: ['dry-run', 'write', 'off']
 
+# Never two Full Flow runs at once (evening + nightly, or a manual run): both would
+# append / fill from the same read. A second run waits; it is not cancelled.
+concurrency:
+  group: fms-full-flow
+  cancel-in-progress: false
+
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
       # Scheduled runs have no inputs -> write.
       BACKFILL_MODE: ${{ github.event.inputs.backfill_mode || 'write' }}
@@ -32,7 +44,7 @@ jobs:
 
       - name: Install dependencies
         id: install
-        run: pip install -r requirements.txt pytest
+        run: pip install -r requirements.txt pytest==9.1.1
 
       # Offline tests (no Google access). If they fail, the Full Flow step is skipped
       # (it would write with broken matching); POD + planned status still run.

@@ -29,7 +29,7 @@ class _Exec:
     def __init__(self, result=None, on_call=None):
         self.result, self.on_call = result, on_call
 
-    def execute(self):
+    def execute(self, **kwargs):
         if self.on_call:
             self.on_call()
         return self.result

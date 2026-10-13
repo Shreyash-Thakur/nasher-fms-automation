@@ -43,7 +43,7 @@ def drive(ff, monkeypatch):
             def __init__(self, page):
                 self.page = page
 
-            def execute(self):
+            def execute(self, **kwargs):
                 return self.page
 
         class _Files:
