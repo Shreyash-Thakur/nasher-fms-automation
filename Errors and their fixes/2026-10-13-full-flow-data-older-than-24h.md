@@ -45,8 +45,14 @@
   - `requirements.txt` pinned to the versions of the last green run (pandas 3.0.6 etc.).
 - **Evidence:** `python -m pytest tests -q` → `128 passed` (100 before + 28 in
   `tests/test_freshness.py`), also under the pinned versions in a clean venv
-  (pandas 3.0.6, `pip check`: No broken requirements found). Live dry-run: see the commit that
-  follows / the report to the user.
+  (pandas 3.0.6, `pip check`: No broken requirements found). Live dry-run 38362883163 (writes
+  nothing; POD/planned skipped), green:
+  `Sales Report daily files in window: 5 (folder has 96 files)` (06–10.10.2026 read) →
+  `Sales Report daily lines: 3,558 read, 2,772 already in the Sales Master, 786 used (not consolidated yet)`
+  → `matched now (would be / are filled): 10`, "Order No not in the Sales Master" 144 → 130; job
+  summary table written; 3 `::warning::` lines "newest file is 10.10.2026 (3 days old)" for Pick
+  Pack / Order Enquiry / Sales daily. So the Sales Master was missing ~786 invoice lines of files
+  that had been in Drive for 2+ days — the consolidation lags by more than the expected day.
 - **Blast radius:** `prepare_sales_lines` output now also holds not-yet-consolidated invoice lines
   → fills of P/Q/S/AS/AW/AX/AY, `OrderEnquiryIndex` (an order with a daily invoice line counts as
   invoiced), the unmatched / "not in Full Flow" reports. Exit code 1 now marks the Full Flow step
