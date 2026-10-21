@@ -147,7 +147,7 @@ def test_foreign_bd7_writes_a_bc_only(ff, make, monkeypatch, capsys):
     assert "WARNING" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("current,bd7,expected", [(60, CODE, 60), (55, "", 56), (55, "Remarks", 55)])
+@pytest.mark.parametrize("current,bd7,expected", [(60, CODE, 60), (55, "", 56), (57, "Remarks", 57)])
 def test_column_count_never_shrinks(ff, make, monkeypatch, current, bd7, expected):
     df = make.existing([{"GT Number": "GT1", "Vinculum SKU": "S"}])
     fake = _write(ff, monkeypatch, df, bd7=bd7, columns=current)
@@ -205,3 +205,39 @@ def test_read_existing_full_flow_reads_bd_and_keeps_alignment(ff, monkeypatch):
 
 def test_clear_full_flow_data_is_gone(ff):
     assert not hasattr(ff, "clear_full_flow_data")
+
+
+def test_grid_expanded_before_bd7_is_read(ff, make, monkeypatch):
+    """A 55-column grid has no BD7: the grid grows to 56 FIRST, then BD7 is read/set
+    (an A1 range outside the grid is refused by the Sheets API)."""
+    order = []
+
+    class OrderedFake(FakeSheets):
+        def get(self, **kw):
+            order.append(("get", kw.get("range", "")))
+            return super().get(**kw)
+
+        def batchUpdate(self, **kw):
+            order.append(("grid", ""))
+            return super().batchUpdate(**kw)
+
+    fake = OrderedFake(bd7="")
+    monkeypatch.setattr(ff, "sheets_service", fake)
+    monkeypatch.setattr(ff, "get_sheet_by_title",
+                        lambda *a: {"gridProperties": {"rowCount": 100, "columnCount": 55}})
+    ff.write_full_flow(1, make.existing([{"GT Number": "GT1", "Vinculum SKU": "S", CODE: "1"}]),
+                       start_row=8)
+    kinds = [k for k, r in order if k == "grid" or r.endswith("!BD7")]
+    assert kinds[:2] == ["grid", "get"]
+    assert _grid(fake)["columnCount"] == 56
+    assert fake.updates[0]["range"] == "'Full Flow FMS'!A8:BD8"
+
+
+def test_read_ranges_never_pass_the_grid(ff):
+    assert ff.fms_read_last_column(49) == "AW"
+    assert ff.fms_read_last_column(52) == "AZ"
+    assert ff.fms_read_last_column(500) == "CZ"
+    assert ff.fms_read_last_column(0) == "CZ"          # metadata unknown
+    assert ff.full_flow_read_last_column(55) == "BC"
+    assert ff.full_flow_read_last_column(56) == "BD"
+    assert ff.full_flow_read_last_column(0) == "BD"

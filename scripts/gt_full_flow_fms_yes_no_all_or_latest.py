@@ -588,14 +588,48 @@ def get_sheet_by_title(spreadsheet_id, title):
     return None
 
 
+def sheet_column_count(spreadsheet_id, title):
+    """Grid column count of a tab, or 0 when the metadata cannot be read."""
+    try:
+        props = get_sheet_by_title(spreadsheet_id, title) or {}
+    except Exception as exc:   # metadata is only used to clamp a range
+        print(f"  (could not read the column count of '{title}': {exc})")
+        return 0
+    return int(props.get("gridProperties", {}).get("columnCount", 0) or 0)
+
+
+def column_letter_of(n):
+    result = ""
+    while n:
+        n, remainder = divmod(n - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+
+def fms_read_last_column(grid_columns):
+    """A:AW always; further right up to FMS_READ_LAST_COLUMN, never past the tab's grid."""
+    limit = 104   # CZ
+    if not grid_columns:
+        return FMS_READ_LAST_COLUMN
+    return column_letter_of(max(len(FMS_SOURCE_COLUMNS), min(limit, int(grid_columns))))
+
+
+def full_flow_read_last_column(grid_columns):
+    """BD when the grid has it (or is unknown), else BC."""
+    if grid_columns and int(grid_columns) < len(OUTPUT_COLUMNS):
+        return column_letter_of(len(OUTPUT_COLUMNS) - 1)
+    return column_letter_of(len(OUTPUT_COLUMNS))
+
+
 def read_fms_sheet():
     print("\nReading FMS tab from SOURCE Google Sheets...")
+    last_column = fms_read_last_column(sheet_column_count(SOURCE_SPREADSHEET_ID, FMS_SHEET_NAME))
 
     # Row 7 is the header; data starts at row 8.
     result = sheets_service.spreadsheets().values().get(
         spreadsheetId=SOURCE_SPREADSHEET_ID,
         # A:AW positional + the header-found customer code column to the right (2026-10-21).
-        range=f"'{FMS_SHEET_NAME}'!A7:{FMS_READ_LAST_COLUMN}",
+        range=f"'{FMS_SHEET_NAME}'!A7:{last_column}",
         valueRenderOption="UNFORMATTED_VALUE",
         dateTimeRenderOption="FORMATTED_STRING",
     ).execute()
@@ -787,10 +821,12 @@ def clean_for_google(value):
 def read_existing_full_flow():
     """Read existing destination rows so already-processed GTs are preserved."""
     print(f"\nReading existing '{FULL_FLOW_SHEET_NAME}' data...")
+    last_column = full_flow_read_last_column(
+        sheet_column_count(OUTPUT_SPREADSHEET_ID, FULL_FLOW_SHEET_NAME))
 
     result = sheets_service.spreadsheets().values().get(
         spreadsheetId=OUTPUT_SPREADSHEET_ID,
-        range=f"'{FULL_FLOW_SHEET_NAME}'!A8:BD",   # BD = customer code (2026-10-21)
+        range=f"'{FULL_FLOW_SHEET_NAME}'!A8:{last_column}",   # BD = customer code (2026-10-21)
         valueRenderOption="UNFORMATTED_VALUE",
         dateTimeRenderOption="FORMATTED_STRING",
     ).execute()
@@ -885,6 +921,41 @@ def write_full_flow(sheet_id, df, start_row=8):
             result = chr(65 + remainder) + result
         return result
 
+    # Expand the destination grid only when the new data requires it. Never shrink it:
+    # GT Pull (Apps Script, 2026-10-12) appends rows in real time, and a rowCount
+    # below the sheet's current size would DELETE the rows past it.
+    # Done FIRST so column BD exists before BD7 is read / written below (an A1 range
+    # outside the grid is refused by the Sheets API).
+    current = get_sheet_by_title(OUTPUT_SPREADSHEET_ID, FULL_FLOW_SHEET_NAME) or {}
+    current_rows = int(current.get("gridProperties", {}).get("rowCount", 0) or 0)
+    required_rows = grid_row_count(current_rows, start_row - 1 + len(df))
+    # Columns: grow, never shrink. Until 2026-10-21 this set columnCount = 55 (A:BC),
+    # which DELETES column BD (Vinculum Customer Code, written by the auto-punch
+    # project) and everything right of it on every night with rows to append.
+    # BD is always kept (an empty BD column is harmless; the auto-punch project needs it).
+    current_columns = int(current.get("gridProperties", {}).get("columnCount", 0) or 0)
+    required_columns = grid_column_count(current_columns, len(OUTPUT_COLUMNS))
+    sheets_service.spreadsheets().batchUpdate(
+        spreadsheetId=OUTPUT_SPREADSHEET_ID,
+        body={
+            "requests": [
+                {
+                    "updateSheetProperties": {
+                        "properties": {
+                            "sheetId": sheet_id,
+                            "gridProperties": {
+                                "rowCount": required_rows,
+                                "columnCount": required_columns,
+                            },
+                        },
+                        "fields": "gridProperties.rowCount,gridProperties.columnCount",
+                    }
+                }
+            ]
+        },
+    ).execute()
+    print(f"  Destination grid ready: {required_rows:,} rows x {required_columns} columns.")
+
     # BD (customer code) only into a column that IS ours: header already there, or
     # BD7 blank -> header added now (runtime, only if missing). Anything else in BD7 ->
     # A:BC only, never codes into a foreign column.
@@ -917,41 +988,7 @@ def write_full_flow(sheet_id, df, start_row=8):
         print("No new Full Flow rows to write.")
         return
 
-    # Expand the destination grid only when the new data requires it. Never shrink it:
-    # GT Pull (Apps Script, 2026-10-12) appends rows in real time, and a rowCount
-    # below the sheet's current size would DELETE the rows past it.
-    current = get_sheet_by_title(OUTPUT_SPREADSHEET_ID, FULL_FLOW_SHEET_NAME) or {}
-    current_rows = int(current.get("gridProperties", {}).get("rowCount", 0) or 0)
-    required_rows = grid_row_count(current_rows, start_row - 1 + len(values))
-    # Columns: grow, never shrink. Until 2026-10-21 this set columnCount = 55 (A:BC),
-    # which DELETES column BD (Vinculum Customer Code, written by the auto-punch
-    # project) and everything right of it on every night with rows to append.
-    current_columns = int(current.get("gridProperties", {}).get("columnCount", 0) or 0)
-    required_columns = grid_column_count(current_columns, len(columns))
-    sheets_service.spreadsheets().batchUpdate(
-        spreadsheetId=OUTPUT_SPREADSHEET_ID,
-        body={
-            "requests": [
-                {
-                    "updateSheetProperties": {
-                        "properties": {
-                            "sheetId": sheet_id,
-                            "gridProperties": {
-                                "rowCount": required_rows,
-                                "columnCount": required_columns,
-                            },
-                        },
-                        "fields": "gridProperties.rowCount,gridProperties.columnCount",
-                    }
-                }
-            ]
-        },
-    ).execute()
-
-    print(
-        f"  Destination grid ready: {required_rows:,} rows x {required_columns} columns "
-        f"(writing A:{column_letter(len(columns))})."
-    )
+    print(f"  Writing A:{column_letter(len(columns))}.")
 
     chunk_size = 500
     end_column = column_letter(len(columns))
