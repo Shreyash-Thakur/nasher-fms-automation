@@ -128,12 +128,19 @@ FMS_SOURCE_COLUMNS = [
     "Delivered Date", "Invoice No",
 ]
 
+# 2026-10-21: Vinculum Customer Code (GT order form -> Orders "Customer Code" ->
+# GT Pull FMS "Vinculum Customer Code", a column appended AFTER A:AW and found by
+# header name). Full Flow keeps it at BD, which the auto-punch project reads
+# positionally (and writes itself after a punch when blank).
+CUSTOMER_CODE_COLUMN = "Vinculum Customer Code"
+
 # Working set of columns held in the in-memory FMS dataframe: the 49 source
-# columns plus the six output-only fields. Order here does NOT matter because
-# every read/write selects by column NAME, not by position.
+# columns plus the six output-only fields and the customer code. Order here does
+# NOT matter because every read/write selects by column NAME, not by position.
 FMS_COLUMNS = FMS_SOURCE_COLUMNS + [
     "Warehouse", "Invoice Amount",
     "Order No", "Team", "Planned", "Actual",
+    CUSTOMER_CODE_COLUMN,
 ]
 
 # ------------------------------------------------------------
@@ -147,6 +154,12 @@ FMS_COLUMNS = FMS_SOURCE_COLUMNS + [
 #   AY    = Invoice Amount
 #   AZ:BC = customer details -> Party Name, Contact Person,
 #           Contact Person Phone Number, Location
+#   BD    = Vinculum Customer Code (2026-10-21). Only APPENDED rows get it (from
+#           the source FMS column); an existing row's BD is never written, cleared
+#           or overwritten here. Rows are only ever appended after the last row and
+#           BD travels inside each row, so no reordering can shift it. (The unused
+#           clear_full_flow_data(), which cleared A8:BC but would have left BD
+#           behind - misaligned against the rows - was removed.)
 #
 # The customer-detail block that physically sits at source P:S is moved to the
 # tail (AZ:BC), and the four workflow fields take its place at output P:S.
@@ -162,7 +175,41 @@ OUTPUT_COLUMNS = (
     + FMS_SOURCE_TAIL
     + ["Warehouse", "Invoice Amount"]
     + CUSTOMER_DETAIL_COLUMNS
+    + [CUSTOMER_CODE_COLUMN]                         # BD
 )
+# Full Flow A:BC without the customer code (written when BD7 is someone else's column).
+OUTPUT_COLUMNS_WITHOUT_CODE = OUTPUT_COLUMNS[:-1]
+CUSTOMER_CODE_CELL = "BD7"                            # Full Flow header cell of the code
+
+# The source FMS is read to here: A:AW positionally + any later column (the code).
+FMS_READ_LAST_COLUMN = "CZ"
+
+
+def find_customer_code_index(raw_headers):
+    """0-based index of the "Vinculum Customer Code" header in the source FMS header
+    row, searched only RIGHT of A:AW (A:AW stay positional). None if absent."""
+    want = CUSTOMER_CODE_COLUMN.lower()
+    for i in range(len(FMS_SOURCE_COLUMNS), len(raw_headers or [])):
+        if str(raw_headers[i] if raw_headers[i] is not None else "").strip().lower() == want:
+            return i
+    return None
+
+
+def normalize_customer_code(value):
+    """Cell -> code text: trimmed; 1004544 / 1004544.0 / "1004544.0" -> "1004544"."""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    text = str(value).strip()
+    if text.endswith(".0") and text[:-2].isdigit():
+        text = text[:-2]
+    return text
 
 
 # Exact Order Enquiry columns used by this automation.
@@ -547,7 +594,8 @@ def read_fms_sheet():
     # Row 7 is the header; data starts at row 8.
     result = sheets_service.spreadsheets().values().get(
         spreadsheetId=SOURCE_SPREADSHEET_ID,
-        range=f"'{FMS_SHEET_NAME}'!A7:AW",
+        # A:AW positional + the header-found customer code column to the right (2026-10-21).
+        range=f"'{FMS_SHEET_NAME}'!A7:{FMS_READ_LAST_COLUMN}",
         valueRenderOption="UNFORMATTED_VALUE",
         dateTimeRenderOption="FORMATTED_STRING",
     ).execute()
@@ -565,6 +613,9 @@ def read_fms_sheet():
     # The FMS source is structurally A:AW (49 columns), so pad the header row
     # to the expected width before applying positional fallback names.
     raw_headers = list(values[0])
+    code_index = find_customer_code_index(raw_headers)
+    codes = [normalize_customer_code(row[code_index]) if code_index is not None
+             and code_index < len(row) else "" for row in values[1:]]
     if len(raw_headers) < len(FMS_SOURCE_COLUMNS):
         raw_headers += [""] * (len(FMS_SOURCE_COLUMNS) - len(raw_headers))
     else:
@@ -605,7 +656,9 @@ def read_fms_sheet():
         normalized_rows.append(row)
 
     fms_df = pd.DataFrame(normalized_rows, columns=headers)
-    fms_df = fms_df.dropna(how="all").reset_index(drop=True)
+    # Attached before dropna so each code stays with its own row.
+    fms_df[CUSTOMER_CODE_COLUMN] = codes
+    fms_df = fms_df.dropna(how="all", subset=headers).reset_index(drop=True)
 
     print("\nFMS headers detected after duplicate-header normalization:")
     print(" | ".join(str(c) for c in headers))
@@ -621,7 +674,7 @@ def read_fms_sheet():
 
     # Keep the source columns exactly in A:AW order. This preserves
     # Party Name / Contact Person / Phone / Location at source P:S.
-    fms_df = fms_df[FMS_SOURCE_COLUMNS].copy()
+    fms_df = fms_df[FMS_SOURCE_COLUMNS + [CUSTOMER_CODE_COLUMN]].copy()
 
     # These are output-only fields and will be populated later.
     fms_df["Warehouse"] = ""
@@ -631,6 +684,11 @@ def read_fms_sheet():
     fms_df["Planned"] = ""
     fms_df["Actual"] = ""
     print(f"FMS rows: {len(fms_df):,}")
+    if code_index is None:
+        print(f"  No '{CUSTOMER_CODE_COLUMN}' column right of AW in the FMS tab - codes blank.")
+    else:
+        print(f"  '{CUSTOMER_CODE_COLUMN}' read from FMS column {code_index + 1}: "
+              f"{int((fms_df[CUSTOMER_CODE_COLUMN] != '').sum()):,} rows with a code.")
     return fms_df
 
 
@@ -662,16 +720,6 @@ def get_output_sheet():
     )
 
     return output_props["sheetId"]
-
-
-def clear_full_flow_data(sheet_id):
-    print(f"Clearing old data from '{FULL_FLOW_SHEET_NAME}'...")
-
-    sheets_service.spreadsheets().values().clear(
-        spreadsheetId=OUTPUT_SPREADSHEET_ID,
-        range=f"'{FULL_FLOW_SHEET_NAME}'!A8:BC",
-        body={},
-    ).execute()
 
 
 def read_warehouse_mapping():
@@ -742,7 +790,7 @@ def read_existing_full_flow():
 
     result = sheets_service.spreadsheets().values().get(
         spreadsheetId=OUTPUT_SPREADSHEET_ID,
-        range=f"'{FULL_FLOW_SHEET_NAME}'!A8:BC",
+        range=f"'{FULL_FLOW_SHEET_NAME}'!A8:BD",   # BD = customer code (2026-10-21)
         valueRenderOption="UNFORMATTED_VALUE",
         dateTimeRenderOption="FORMATTED_STRING",
     ).execute()
@@ -771,6 +819,37 @@ def grid_row_count(current_rows, required_rows):
     return max(int(current_rows or 0), int(required_rows))
 
 
+def grid_column_count(current_columns, required_columns):
+    """Column count to set on the Full Flow grid: grow when needed, never shrink."""
+    return max(int(current_columns or 0), int(required_columns))
+
+
+def full_flow_code_column_ready():
+    """True when appended rows may carry the customer code in BD: BD7 already reads
+    "Vinculum Customer Code", or BD7 is blank and the header is written now (only if
+    missing). False (with a WARNING) when BD7 holds another header."""
+    result = sheets_service.spreadsheets().values().get(
+        spreadsheetId=OUTPUT_SPREADSHEET_ID,
+        range=f"'{FULL_FLOW_SHEET_NAME}'!{CUSTOMER_CODE_CELL}",
+    ).execute()
+    values = result.get("values", []) or [[]]
+    current = str((values[0] or [""])[0] if values else "").strip()
+    if current.lower() == CUSTOMER_CODE_COLUMN.lower():
+        return True
+    if current == "":
+        sheets_service.spreadsheets().values().update(
+            spreadsheetId=OUTPUT_SPREADSHEET_ID,
+            range=f"'{FULL_FLOW_SHEET_NAME}'!{CUSTOMER_CODE_CELL}",
+            valueInputOption="RAW",
+            body={"values": [[CUSTOMER_CODE_COLUMN]]},
+        ).execute()
+        print(f"  Full Flow {CUSTOMER_CODE_CELL} was blank - header '{CUSTOMER_CODE_COLUMN}' added.")
+        return True
+    print(f"WARNING: Full Flow {CUSTOMER_CODE_CELL} reads {current!r}, not "
+          f"'{CUSTOMER_CODE_COLUMN}' - appending A:BC only, customer codes NOT written.")
+    return False
+
+
 def drop_rows_now_in_full_flow(new_df, fresh_existing_df):
     """Rows to append minus those whose GT + Vinculum SKU reached Full Flow while this
     job was running (GT Pull's realtime Apps Script appends approved lines within
@@ -793,7 +872,11 @@ def write_full_flow(sheet_id, df, start_row=8):
     )
     print("  Output layout: A:O=FMS head | P:S=Order No/Team/Planned/Actual | "
           "T:AW=FMS tail | AX=Warehouse | AY=Invoice Amount | "
-          "AZ:BC=Party Name/Contact Person/Phone/Location")
+          "AZ:BC=Party Name/Contact Person/Phone/Location | BD=Vinculum Customer Code")
+
+    if df is None or df.empty:
+        print("No new Full Flow rows to write.")
+        return
 
     def column_letter(n):
         result = ""
@@ -801,6 +884,12 @@ def write_full_flow(sheet_id, df, start_row=8):
             n, remainder = divmod(n - 1, 26)
             result = chr(65 + remainder) + result
         return result
+
+    # BD (customer code) only into a column that IS ours: header already there, or
+    # BD7 blank -> header added now (runtime, only if missing). Anything else in BD7 ->
+    # A:BC only, never codes into a foreign column.
+    columns = OUTPUT_COLUMNS if full_flow_code_column_ready() else OUTPUT_COLUMNS_WITHOUT_CODE
+    df = df.reindex(columns=columns, fill_value="")
 
     open_qty_index = OUTPUT_COLUMNS.index("Open Qty")
     order_qty_column = column_letter(OUTPUT_COLUMNS.index("Order Quantity") + 1)
@@ -834,6 +923,11 @@ def write_full_flow(sheet_id, df, start_row=8):
     current = get_sheet_by_title(OUTPUT_SPREADSHEET_ID, FULL_FLOW_SHEET_NAME) or {}
     current_rows = int(current.get("gridProperties", {}).get("rowCount", 0) or 0)
     required_rows = grid_row_count(current_rows, start_row - 1 + len(values))
+    # Columns: grow, never shrink. Until 2026-10-21 this set columnCount = 55 (A:BC),
+    # which DELETES column BD (Vinculum Customer Code, written by the auto-punch
+    # project) and everything right of it on every night with rows to append.
+    current_columns = int(current.get("gridProperties", {}).get("columnCount", 0) or 0)
+    required_columns = grid_column_count(current_columns, len(columns))
     sheets_service.spreadsheets().batchUpdate(
         spreadsheetId=OUTPUT_SPREADSHEET_ID,
         body={
@@ -844,7 +938,7 @@ def write_full_flow(sheet_id, df, start_row=8):
                             "sheetId": sheet_id,
                             "gridProperties": {
                                 "rowCount": required_rows,
-                                "columnCount": len(OUTPUT_COLUMNS),
+                                "columnCount": required_columns,
                             },
                         },
                         "fields": "gridProperties.rowCount,gridProperties.columnCount",
@@ -855,11 +949,12 @@ def write_full_flow(sheet_id, df, start_row=8):
     ).execute()
 
     print(
-        f"  Destination grid ready: {required_rows:,} rows x {len(OUTPUT_COLUMNS)} columns."
+        f"  Destination grid ready: {required_rows:,} rows x {required_columns} columns "
+        f"(writing A:{column_letter(len(columns))})."
     )
 
     chunk_size = 500
-    end_column = column_letter(len(OUTPUT_COLUMNS))
+    end_column = column_letter(len(columns))
 
     for start in range(0, len(values), chunk_size):
         chunk = values[start:start + chunk_size]
@@ -2454,6 +2549,9 @@ def plan_existing_writes(existing_df, slots, lines, pick_pack_lookup, warehouse_
                 stats["refreshed_rows"] += 1
                 stats["refresh_cells"] += len(row_cells)
             writes.extend(row_cells)
+    # BD (customer code) of an existing row is never written here: the auto-punch
+    # project owns it once a row exists.
+    writes = [w for w in writes if w[1] != CUSTOMER_CODE_COLUMN]
     return writes, stats
 
 

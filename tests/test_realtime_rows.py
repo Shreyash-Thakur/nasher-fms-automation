@@ -36,11 +36,13 @@ class _Exec:
 
 
 class FakeSheets:
-    """Records Sheets API calls made by read_fms_sheet / write_full_flow."""
+    """Records Sheets API calls made by read_fms_sheet / write_full_flow.
+    bd7 = what Full Flow's BD7 header cell holds (write_full_flow reads it first)."""
 
-    def __init__(self, get_values=None):
+    def __init__(self, get_values=None, bd7="Vinculum Customer Code"):
         self.get_values = get_values or []
-        self.updates, self.batch = [], []
+        self.bd7 = bd7
+        self.updates, self.batch, self.header_writes = [], [], []
 
     def spreadsheets(self):
         return self
@@ -49,10 +51,13 @@ class FakeSheets:
         return self
 
     def get(self, **kw):
+        if kw.get("range", "").endswith("!BD7"):
+            return _Exec({"values": [[self.bd7]]} if self.bd7 else {})
         return _Exec({"values": self.get_values})
 
     def update(self, **kw):
-        return _Exec(on_call=lambda: self.updates.append(kw))
+        target = self.header_writes if kw.get("range", "").endswith("!BD7") else self.updates
+        return _Exec(on_call=lambda: target.append(kw))
 
     def batchUpdate(self, **kw):
         return _Exec(on_call=lambda: self.batch.append(kw))
@@ -79,7 +84,9 @@ def test_contract_apps_script_row_equals_nightly_row(ff, monkeypatch, display):
                         lambda *a: {"gridProperties": {"rowCount": 100}})
     ff.write_full_flow(123, new_df, start_row=c["sheet_row"])
     written = fake.updates[0]["body"]["values"][0]
-    assert len(written) == len(ff.OUTPUT_COLUMNS) == len(c["full_flow_row"]) == 55
+    assert len(written) == len(ff.OUTPUT_COLUMNS) == len(c["full_flow_row"]) == 56
+    assert fake.updates[0]["range"].endswith(f"!A{c['sheet_row']}:BD{c['sheet_row']}")
+    assert written[55] == "1004544"   # BD = Vinculum Customer Code from the FMS column
     for i, (py, js) in enumerate(zip(written, c["full_flow_row"])):
         py = "" if py is None else py
         assert py == js, f"column {ff.OUTPUT_COLUMNS[i]} ({i}): nightly {py!r} != Apps Script {js!r}"
