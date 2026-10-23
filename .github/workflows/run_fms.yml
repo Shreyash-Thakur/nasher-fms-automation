@@ -39,7 +39,6 @@ jobs:
     env:
       # Scheduled runs have no inputs -> write.
       BACKFILL_MODE: ${{ github.event.inputs.backfill_mode || 'write' }}
-      SALES_DAILY_LOOKBACK_DAYS: ${{ github.event.inputs.sales_lookback_days || '7' }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -63,6 +62,8 @@ jobs:
         id: fullflow
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          # Only this step: a job-level value leaked into "Run tests", which assume the 7-day default (23-Oct-2026).
+          SALES_DAILY_LOOKBACK_DAYS: ${{ github.event.inputs.sales_lookback_days || '7' }}
         run: python scripts/gt_full_flow_fms_yes_no_all_or_latest.py
 
       - name: Upload Full Flow reports (suspect cancellations, unmatched rows)
