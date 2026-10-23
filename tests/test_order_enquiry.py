@@ -254,7 +254,9 @@ def test_never_overwrite_and_closed_untouched(make):
         oe_rows=[{"Order No": "N1", "ExtOrderNo": "GT1"}, {"Order No": "N2", "ExtOrderNo": "GT2"},
                  {"Order No": "N3", "ExtOrderNo": "GT3"}])
     c = make.cells(writes)
-    assert c == {(8, "Order No"): "N1"}
+    # P is never overwritten; since 2026-10-23 a filled P without an invoice gets its
+    # punch date S from Order Enquiry (row 10).
+    assert c == {(8, "Order No"): "N1", (10, "Actual"): pd.Timestamp("2026-10-06 23:58")}
 
 
 def test_idempotent(ff, make):

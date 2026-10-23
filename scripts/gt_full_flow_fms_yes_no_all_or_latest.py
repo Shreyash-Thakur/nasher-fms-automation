@@ -69,7 +69,17 @@ ORDER_ENQUIRY_DAILY_PREFIX = "orderenquiry_"   # compared lower-case; monthly du
 # lines that are not in the Sales Master yet are used too (2026-10-13; record
 # "Errors and their fixes/2026-10-13-full-flow-data-older-than-24h.md").
 SALES_DAILY_FOLDER_ID = "1iL94fl0nUOxZ_pEWH_AuxnqBYsYjsjt_"
-SALES_DAILY_LOOKBACK_DAYS = 7
+# Catch-up after a Vinculum outage (2026-10-23): a manual run can read further back with
+# env SALES_DAILY_LOOKBACK_DAYS (workflow input sales_lookback_days); scheduled runs keep 7.
+def _lookback_days(raw, default=7):
+    try:
+        days = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return days if 0 < days <= 62 else default
+
+
+SALES_DAILY_LOOKBACK_DAYS = _lookback_days(os.environ.get("SALES_DAILY_LOOKBACK_DAYS"))
 SALES_DAILY_TAB_PREFIX = "daily:"
 
 # ------------------------------------------------------------
@@ -2368,7 +2378,7 @@ def prepare_sales_lines(sales_df):
 class _Slot:
     """One Full Flow row (existing) or FMS row (to be appended) taking part in matching."""
     __slots__ = ("kind", "ref", "gt", "base", "sku", "sku_alt", "order", "closed",
-                 "anchor", "assigned", "tier", "oe_order", "oe_outcome")
+                 "anchor", "assigned", "tier", "oe_order", "oe_outcome", "_orders")
 
     def __init__(self, kind, ref, row):
         self.kind = kind
@@ -2385,6 +2395,31 @@ class _Slot:
         self.tier = None
         self.oe_order = None    # daily Order Enquiry order key used for P/S (no Sales line)
         self.oe_outcome = None  # OrderEnquiryIndex.match outcome for a row left unmatched
+        self._orders = None
+
+    @property
+    def orders(self):
+        """Every Vinculum Order No in P. The punch portal writes one per warehouse part,
+        comma-separated ("N012271, N461768"), when a GT is split across warehouses."""
+        if self._orders is None or self._orders[0] != self.order:
+            self._orders = (self.order, split_order_nos(self.order))
+        return self._orders[1]
+
+
+_ORDER_NO_SEPARATORS = re.compile(r"[,;/|&]+")
+
+
+def split_order_nos(value):
+    """P cell -> tuple of normalised Order Nos ("N012271, N461768" -> ("N012271", "N461768")).
+    One Order No -> a 1-tuple; blank / closed marker -> ()."""
+    order = normalize_value(value)
+    if not order or order.lower() in CLOSED_MARKERS:
+        return ()
+    out = []
+    for token in _ORDER_NO_SEPARATORS.split(order):
+        if token and token not in out:
+            out.append(token)
+    return tuple(out)
 
 
 def _match_tier(slot, line):
@@ -2436,7 +2471,7 @@ def allocate_lines(slots, lines):
                 continue
             best = None
             for lid in line_ids:
-                if lid in used or records[lid]["_ORDER"] != slot.order:
+                if lid in used or records[lid]["_ORDER"] not in slot.orders:
                     continue
                 tier = _match_tier(slot, records[lid])
                 if tier is not None and (best is None or tier < best[0]):
@@ -2505,6 +2540,39 @@ def _oe_cells(row, record, order_key, pick_pack_lookup, sheet_row):
     return cells
 
 
+def _order_no_cells(row, orders, oe_index, pick_pack_lookup, sheet_row):
+    """Row whose P already holds Vinculum Order No(s) (written by the auto-punch portal
+    or by hand) but no Sales Master line yet (not invoiced): blank cells only.
+      S (Actual) / Q (Team) <- the daily Order Enquiry record of those orders (earliest
+          Order Date when P lists several; cancelled orders ignored).  2026-10-23: before
+          this, S stayed blank until the invoice, so portal-punched GTs showed "not
+          punched" on the FMS_Dashboard (12-15 Oct gap).
+      V (Warehouse Team) / X (Actual.1) <- Pick Pack; with several orders in P only when
+          EVERY one has a Pick Date (latest wins), so a half-picked split GT is not done.
+    P itself is never written here."""
+    cells = []
+    records = oe_index.records if oe_index is not None else {}
+    found = [records[o] for o in orders if o in records
+             and records[o].get("order_date") is not None
+             and not pd.isna(records[o].get("order_date"))]
+    if found:
+        first = min(found, key=lambda r: pd.Timestamp(r["order_date"]))
+        for column, key in (("Actual", "order_date"), ("Team", "team")):
+            value = first.get(key)
+            if value is not None and value_found(value) and not value_found(row[column]):
+                cells.append((sheet_row, column, value, "oe_refresh"))
+
+    if len(orders) == 1:
+        return cells + _pick_pack_cells(row, orders[0], pick_pack_lookup, sheet_row, "refresh")
+    picks = [pick_pack_lookup.get(o) for o in orders]
+    if orders and all(p and p["Pick Date"] is not None and not pd.isna(p["Pick Date"])
+                      for p in picks):
+        latest = max(picks, key=lambda p: pd.Timestamp(p["Pick Date"]))
+        key = orders[picks.index(latest)]
+        cells += _pick_pack_cells(row, key, {key: latest}, sheet_row, "refresh")
+    return cells
+
+
 def plan_existing_writes(existing_df, slots, lines, pick_pack_lookup, warehouse_mapping,
                          oe_index=None):
     """Cell writes for existing rows: blank cells only, never a closed row.
@@ -2516,6 +2584,7 @@ def plan_existing_writes(existing_df, slots, lines, pick_pack_lookup, warehouse_
              "tiers": {1: 0, 2: 0, 3: 0}, "anchored_rows": 0,
              "stale_zero_dispatched": 0, "order_no_without_line": 0,
              "oe_filled_rows": 0, "oe_fill_cells": 0,
+             "order_no_oe_rows": 0, "order_no_oe_cells": 0,
              "oe_outcomes": {k: 0 for k in ("ambiguous", "only_cancelled", "unique_order_invoiced",
                                             "unique_order_not_in_oe", "not_in_vinculum", "no_gt")}}
     writes = []
@@ -2548,11 +2617,16 @@ def plan_existing_writes(existing_df, slots, lines, pick_pack_lookup, warehouse_
             line_id, reason = slot.anchor, "refresh"
             stats["anchored_rows"] += 1
         else:
-            # P is filled but its line is not in Order Enquiry. Pick Pack is keyed by
-            # Order No, so V/X can still come from the row's own P (blank cells only).
+            # P is filled but no Sales Master line (punched, not invoiced). S/Q come from
+            # the daily Order Enquiry by the row's own P, V/X from Pick Pack (both keyed
+            # by Order No; blank cells only).
             stats["order_no_without_line"] += 1
-            row_cells = _pick_pack_cells(row, slot.order, pick_pack_lookup,
-                                         8 + int(i), "refresh")
+            row_cells = _order_no_cells(row, slot.orders, oe_index, pick_pack_lookup,
+                                        8 + int(i))
+            oe_cells = sum(1 for c in row_cells if c[3] == "oe_refresh")
+            if oe_cells:
+                stats["order_no_oe_rows"] += 1
+                stats["order_no_oe_cells"] += oe_cells
             if row_cells:
                 stats["refreshed_rows"] += 1
                 stats["refresh_cells"] += len(row_cells)
@@ -3073,6 +3147,8 @@ def main():
     print(f"  refresh cells:                              {stats['refresh_cells']:,}")
     print(f"Rows with an Order No not in the Sales Master (no invoice refresh yet): "
           f"{stats['order_no_without_line']:,}")
+    print(f"  of which get S/Q (punch date) from Order Enquiry by their own P: "
+          f"{stats.get('order_no_oe_rows', 0):,}  (cells {stats.get('order_no_oe_cells', 0):,})")
     print(f"Rows with Dispatched Qty 0 but Vinculum picked >0 (not overwritten): "
           f"{stats['stale_zero_dispatched']:,}")
     print(f"Extra Vinculum lines not placed (split shipments): {len(unplaced):,}")

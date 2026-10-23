@@ -19,6 +19,12 @@ on:
         default: 'write'
         type: choice
         options: ['dry-run', 'write', 'off']
+      sales_lookback_days:
+        description: >-
+          Days of daily Sales Report files (DD.MM.YYYY) to read directly (default 7).
+          Raise for a catch-up after a Vinculum outage, e.g. 12 on 23-Oct reads 11.10 onward.
+        required: false
+        default: '7'
 
 # Never two Full Flow runs at once (evening + nightly, or a manual run): both would
 # append / fill from the same read. A second run waits; it is not cancelled.
@@ -33,6 +39,7 @@ jobs:
     env:
       # Scheduled runs have no inputs -> write.
       BACKFILL_MODE: ${{ github.event.inputs.backfill_mode || 'write' }}
+      SALES_DAILY_LOOKBACK_DAYS: ${{ github.event.inputs.sales_lookback_days || '7' }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
