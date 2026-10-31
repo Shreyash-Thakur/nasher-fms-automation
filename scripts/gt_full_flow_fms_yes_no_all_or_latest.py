@@ -490,7 +490,7 @@ class RunHealth:
     def source(self, key, label, daily=True):
         return self.sources.setdefault(key, {
             "label": label, "daily": daily, "found": 0, "read": 0, "rows": 0,
-            "skipped": [], "newest": None, "note": ""})
+            "skipped": [], "newest": None, "note": "", "warnings": []})
 
     def _src(self, key):
         return self.sources.get(key) or self.source(key, key)
@@ -512,6 +512,10 @@ class RunHealth:
     def note(self, key, text):
         self._src(key)["note"] = text
 
+    def warn(self, key, text):
+        """A problem that must be seen but must not fail the run (e.g. a damaged file)."""
+        self._src(key).setdefault("warnings", []).append(str(text))
+
     def problems(self, today):
         """(errors, warnings): recent skipped files are errors; older skips, a stale
         or empty daily source are warnings."""
@@ -524,6 +528,7 @@ class RunHealth:
                     errors.append(msg)
                 else:
                     warns.append(msg)
+            warns.extend(f"{src['label']}: {m}" for m in src.get("warnings", []))
             if not src["daily"]:
                 continue
             if src["newest"] is None:
@@ -1436,6 +1441,16 @@ def _read_sales_daily_sheet(file_info):
     return _read_workbook_tabs(raw, SALES_REQUIRED_COLUMNS, rename=normalize_sales_header)
 
 
+def sales_rows_without_invoice(df):
+    """Rows of a Sales Report file with a blank Invoice No. A complete Vinculum Sales
+    Report has an invoice on every row (09/15/16.10.2026: 0 blank). 2026-10-31: in
+    10.10.2026, 803 of 869 rows end after "Shipping IGST" - Invoice No, warehouse,
+    Total and Created by are missing - so those lines only ever gave AS (Pick Qty)."""
+    if "Invoice No" not in df.columns:
+        return len(df)
+    return int((~df["Invoice No"].map(value_found)).sum())
+
+
 def read_sales_daily_files(today=None):
     """Daily Vinculum Sales Report files of the last SALES_DAILY_LOOKBACK_DAYS days
     (folder SALES_DAILY_FOLDER_ID). Rows get _TAB = "daily:<file name>";
@@ -1479,6 +1494,13 @@ def read_sales_daily_files(today=None):
             continue
         df = df.dropna(how="all").copy()
         df["_TAB"] = SALES_DAILY_TAB_PREFIX + str(name).strip()
+        no_invoice = sales_rows_without_invoice(df)
+        if no_invoice:
+            print(f"WARNING: {name}: {no_invoice:,} of {len(df):,} rows have no Invoice No "
+                  f"(file cut off / damaged?) - their AW/AX/AY/Q cannot be filled; "
+                  f"re-export it in nasher-miles-report-automation")
+            RUN_HEALTH.warn("sales_daily", f"{name}: {no_invoice:,} of {len(df):,} rows "
+                                           f"have no Invoice No (re-export the file)")
         frames.append(df)
         RUN_HEALTH.read("sales_daily", name, len(df))
         print(f"Read: {name} -> {len(df):,} rows")
@@ -2378,7 +2400,8 @@ def prepare_sales_lines(sales_df):
 class _Slot:
     """One Full Flow row (existing) or FMS row (to be appended) taking part in matching."""
     __slots__ = ("kind", "ref", "gt", "base", "sku", "sku_alt", "order", "closed",
-                 "anchor", "assigned", "tier", "oe_order", "oe_outcome", "_orders")
+                 "anchor", "assigned", "tier", "oe_order", "oe_outcome", "_orders",
+                 "other_order")
 
     def __init__(self, kind, ref, row):
         self.kind = kind
@@ -2396,6 +2419,7 @@ class _Slot:
         self.oe_order = None    # daily Order Enquiry order key used for P/S (no Sales line)
         self.oe_outcome = None  # OrderEnquiryIndex.match outcome for a row left unmatched
         self._orders = None
+        self.other_order = False  # anchor is a line of ANOTHER order than P (see allocate_lines)
 
     @property
     def orders(self):
@@ -2446,6 +2470,11 @@ def allocate_lines(slots, lines):
        by tier, take the first unused matching line.
     3. Expand: leftover tier-1/2 lines of a GT+SKU that is being appended go to the
        last appended row of that key (one output row per line, as before).
+    4. Other order (2026-10-31): a leftover line goes to an existing row of the same GT +
+       Vinculum SKU (tier 1/2) whose P holds the WRONG order of a split GT - see
+       _other_order_slot. The row's blank cells are filled from it; P is never written.
+    Within a tier, a copy of the line WITH an Invoice No is taken before one without
+    (2026-10-31: the 10.10.2026 Sales Report has rows cut off before Invoice No).
     Leftover matching lines are returned as unplaced (reported, not inserted).
     """
     lines_by_base = {}
@@ -2453,6 +2482,8 @@ def allocate_lines(slots, lines):
         if base:
             lines_by_base.setdefault(base, []).append(line_id)
     records = lines[["_GT", "_GT_BASE", "_SKU", "_SKU_ALT", "_ORDER"]].to_dict("index")
+    invoiced = (lines["Invoice No"].map(value_found).to_dict() if "Invoice No" in lines.columns
+                else {})
 
     slots_by_base = {}
     for slot in slots:
@@ -2464,6 +2495,9 @@ def allocate_lines(slots, lines):
         line_ids = lines_by_base.get(base, [])
         if not line_ids:
             continue
+        # Invoiced copies first (stable): a truncated copy without Invoice No never
+        # hides the complete one.
+        line_ids = sorted(line_ids, key=lambda lid: not invoiced.get(lid, False))
         used = set()
 
         for slot in group:
@@ -2506,9 +2540,44 @@ def allocate_lines(slots, lines):
                 takers[-1].assigned.append(lid)
                 used.add(lid)
                 continue
+            taker = _other_order_slot(group, line_ids, records, lid)
+            if taker is not None:
+                taker.anchor, taker.tier, taker.other_order = lid, _match_tier(taker, records[lid]), True
+                used.add(lid)
+                continue
             if any(_match_tier(s, records[lid]) is not None for s in group if not s.closed):
                 unplaced.append(lid)
     return unplaced
+
+
+def _other_order_slot(group, line_ids, records, lid):
+    """Existing row that should get leftover line lid although its P names another order.
+
+    2026-10-31: on GT141026A1 / GT151026A5 one Order No (O94134 / M892795) was written
+    into P of EVERY row, but Vinculum split the GT into several orders. The lines of the
+    other orders were "unplaced" every night and AS/AW/AX/AY/Q stayed blank. A row takes
+    the line only when ALL hold (first such row of the GT wins; one line per row):
+      - open existing row, P filled, not anchored yet, same Vinculum SKU (tier 1/2);
+      - the line's order is in NO row's P of this GT (an order other rows claim keeps
+        its lines for them, e.g. a second shipment);
+      - P's order(s) have at least one Sales line in this GT (invoiced, so their SKUs
+        are known) and none for this row's SKU.
+    """
+    line = records[lid]
+    claimed = set()
+    for s in group:
+        claimed.update(s.orders)
+    if line["_ORDER"] in claimed:
+        return None
+    for slot in group:
+        if slot.kind != "existing" or slot.closed or not slot.order or slot.anchor is not None:
+            continue
+        if (_match_tier(slot, line) or 9) > 2:
+            continue
+        own = [l for l in line_ids if records[l]["_ORDER"] in slot.orders]
+        if own and all(_match_tier(slot, records[l]) is None for l in own):
+            return slot
+    return None
 
 
 def _pick_pack_cells(row, order_key, pick_pack_lookup, sheet_row, reason):
@@ -2585,6 +2654,7 @@ def plan_existing_writes(existing_df, slots, lines, pick_pack_lookup, warehouse_
              "stale_zero_dispatched": 0, "order_no_without_line": 0,
              "oe_filled_rows": 0, "oe_fill_cells": 0,
              "order_no_oe_rows": 0, "order_no_oe_cells": 0,
+             "other_order_rows": 0, "other_order_cells": 0,
              "oe_outcomes": {k: 0 for k in ("ambiguous", "only_cancelled", "unique_order_invoiced",
                                             "unique_order_not_in_oe", "not_in_vinculum", "no_gt")}}
     writes = []
@@ -2613,6 +2683,9 @@ def plan_existing_writes(existing_df, slots, lines, pick_pack_lookup, warehouse_
                 continue
             line_id, reason = slot.assigned[0], "fill"
             stats["tiers"][slot.tier] += 1
+        elif slot.anchor is not None and slot.other_order:
+            line_id, reason = slot.anchor, "refresh_other_order"
+            stats["other_order_rows"] += 1
         elif slot.anchor is not None:
             line_id, reason = slot.anchor, "refresh"
             stats["anchored_rows"] += 1
@@ -2659,6 +2732,8 @@ def plan_existing_writes(existing_df, slots, lines, pick_pack_lookup, warehouse_
             else:
                 stats["refreshed_rows"] += 1
                 stats["refresh_cells"] += len(row_cells)
+                if reason == "refresh_other_order":
+                    stats["other_order_cells"] += len(row_cells)
             writes.extend(row_cells)
     # BD (customer code) of an existing row is never written here: the auto-punch
     # project owns it once a row exists.
@@ -2760,6 +2835,37 @@ def report_suspect_cancellations(existing_df, sales_lines, path=None):
             print(f"  row {r['sheet_row']}: {r['gt_number']} / {r['vinculum_sku']} -> "
                   f"{r['vinculum_order_nos']} (ext {r['vinculum_ext_order_nos']}; "
                   f"inv {r['vinculum_invoice_nos'] or '-'}) [{r['pattern']}]")
+    if path:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        report.to_csv(path, index=False)
+        print(f"Full list written to {path} (workflow artifact 'fullflow-reports').")
+    return report
+
+
+def report_order_no_mismatch(existing_df, slots, sales_lines, path=None):
+    """READ-ONLY. Rows filled tonight from a line of ANOTHER Vinculum order than their P
+    (allocate_lines step 4). P itself is never changed by the job: ops should correct it
+    (the POD sync and the dashboards look orders up by P)."""
+    rows = []
+    for slot in slots:
+        if slot.kind != "existing" or not slot.other_order or slot.anchor is None:
+            continue
+        line = sales_lines.loc[slot.anchor]
+        row = existing_df.loc[slot.ref]
+        rows.append({
+            "sheet_row": 8 + int(slot.ref), "gt_number": row["GT Number"],
+            "vinculum_sku": row["Vinculum SKU"], "order_no_in_p": row["Order No"],
+            "vinculum_order_for_sku": line["Order No"],
+            "vinculum_invoice_no": line["Invoice No"] if value_found(line["Invoice No"]) else "",
+        })
+    report = pd.DataFrame(rows, columns=["sheet_row", "gt_number", "vinculum_sku",
+                                         "order_no_in_p", "vinculum_order_for_sku",
+                                         "vinculum_invoice_no"])
+    print(f"Rows filled from another order of their GT (P names a different order; "
+          f"P left as is, fix it by hand): {len(report):,}")
+    for _, r in report.head(10).iterrows():
+        print(f"  row {r['sheet_row']}: {r['gt_number']} / {r['vinculum_sku']} P={r['order_no_in_p']}"
+              f" -> Vinculum {r['vinculum_order_for_sku']} inv {r['vinculum_invoice_no'] or '-'}")
     if path:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         report.to_csv(path, index=False)
@@ -3149,6 +3255,8 @@ def main():
           f"{stats['order_no_without_line']:,}")
     print(f"  of which get S/Q (punch date) from Order Enquiry by their own P: "
           f"{stats.get('order_no_oe_rows', 0):,}  (cells {stats.get('order_no_oe_cells', 0):,})")
+    print(f"Rows filled from a line of ANOTHER order of their GT (P wrong; split GT): "
+          f"{stats['other_order_rows']:,}  (cells {stats['other_order_cells']:,})")
     print(f"Rows with Dispatched Qty 0 but Vinculum picked >0 (not overwritten): "
           f"{stats['stale_zero_dispatched']:,}")
     print(f"Extra Vinculum lines not placed (split shipments): {len(unplaced):,}")
@@ -3188,6 +3296,10 @@ def main():
     report_suspect_cancellations(
         existing_full_flow_df, sales_lines,
         path=os.path.join("reports", "suspect_cancellations.csv"))
+
+    report_order_no_mismatch(
+        existing_full_flow_df, slots, sales_lines,
+        path=os.path.join("reports", "order_no_mismatch.csv"))
 
     report_vinculum_gt_orders_not_in_full_flow(
         oe_orders, sales_lines, existing_full_flow_df, fms_df,
