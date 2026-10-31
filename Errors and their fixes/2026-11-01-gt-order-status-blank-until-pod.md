@@ -1,0 +1,63 @@
+# GT Full Flow AJ "Order Delivery Status" stays blank until a POD arrives
+
+- **Date:** 2026-11-01
+- **Reported as:** "why are so many order status in GT FMS empty"
+- **Symptom:** in the 1-Nov export of Full Flow FMS (header row 7, data from row 8), 3,040 of 9,573 lines have a blank AJ. None of them is closed. They split into:
+  - 2,004 invoiced (AW Invoice No filled) but no POD yet;
+  - 759 with no Vinculum order (P blank);
+  - 277 ordered but not invoiced.
+  - The other AJ values are Delivered 4,355, Cancelled 2,140 and Virtual Invoice 38.
+- **Where:** `scripts/gt_full_flow_fms_pod_update_google_sheet_gt_and_order_only.py`, `build_sheet_update_requests`. This is the only job step that writes AJ.
+- **Root cause:**
+  - AJ had three writers, and each wrote one terminal value only:
+    - the POD step writes "Delivered" when a POD matches;
+    - the portal / GT_FMS Cancel writes "Cancelled";
+    - GT_FMS `markVirtualGT_` writes "Virtual Invoice".
+  - No writer covered the stages in between, so a line stayed blank from punch until its POD arrived.
+  - The POD step also read only A:AV, so it never saw AW (Invoice No).
+- **Why it wasn't caught:**
+  - A blank AJ was the designed state for "not delivered yet". The dashboards only count `=== 'delivered'`, so a blank AJ never showed up as an error.
+  - The main script's fill-rate table lists AJ, but it is only printed. No check looks at it.
+- **Fix (exact rule):**
+  - The ladder is **blank < Invoiced < Dispatched < Delivered**:
+    - **Invoiced**: AW (Invoice No) is filled and is not a closed marker.
+    - **Dispatched**: AE (AWB) is filled and is not a closed marker.
+    - **Delivered**: a POD matched, as before.
+  - AJ is written only when it is blank or holds a lower stage (case-insensitive). It is never downgraded, and a stage is never rewritten with the same stage.
+  - Any other text in AJ is never replaced, for example "Returned" or a note. The POD step used to overwrite any value other than "Delivered".
+  - Closed lines are never touched. A line is closed when C or any cell of **P:AW** says Cancelled, Virtual Invoice, Out of stock or OOS. The range was P:AV and now includes AW, because GT_FMS Cancel stamps P:AW.
+  - The read range is now A:AW. AJ writes go into the same `updates` list as AP/AU/AV, which is written in batches of 500 ranges per `batchUpdate`. The first run adds about 2,004 cells, which is 5 calls.
+  - The run summary prints the AJ count per stage.
+- **What counts as dispatch evidence:** the 1-Nov export was checked column by column.
+  - **AE (AWB)** never holds a real AWB. Its only values are Cancelled (2,127) and Virtual Invoice (3).
+  - **AB / AG / AL "Actual"** are not evidence. The planned-status step fills them on plan from X, as X + 30m, + 6h and + 30m (`resolve_stage_actual`). Using AG would mark every picked line "Dispatched" before it is even invoiced.
+  - **AS Dispatched Qty** is the Vinculum Pick Qty of the invoice line. It comes from the same Sales file as AW, so it adds nothing beyond "Invoiced".
+  - So "Dispatched" means a real AWB in AE, and **today no line qualifies**. The stage appears once something writes AWBs into AE.
+- **AJ readers checked:**
+  - **This repo:**
+    - The main script's `CANCELLED_STATUS_COLUMNS` and `row_is_closed` match only Cancelled and the closed markers.
+    - The fill-rate table will now count Invoiced lines as "filled". That is a display change only.
+    - The planned-status script does not read AJ.
+  - **GT_FMS:** `dashboard.js`, `Pod_Logic.js`, `Pod_Upload.js`, `Pod_DriveSync.js` and `Code.js planVirtualGT_` compare AJ exactly with 'delivered' or with the closed list.
+    - Pod_Upload and Pod_DriveSync promote any value other than "Delivered" to "Delivered" on a POD. That is the same direction as the ladder.
+    - Virtual Invoice can still be set on Invoiced or Dispatched lines.
+  - **GT form `RepunchGt.js`:** treats AJ "dispatched" as shipped. That is correct, and an invoiced line was already refused through AW.
+  - **Portal (`_wt_rel99`):** `GT_FMS_SKIP_STATUSES` (punch_sources, punch_search, purgeStaleHolds, FreightIntegration) includes 'dispatched'. Those lines already have P and AW, so they were not actionable anyway. "invoiced" is in no skip list, and punch_search already shows a line with an invoice as 'Invoiced'.
+  - Nothing needed a change outside this repo.
+  - **Sheet formulas:** the AJ–AN cells hold values only.
+    - AT has the Open Qty formula, which reads J and AS only.
+    - 214 rows (6648–9319) carry that formula shifted into AV/AW/AX. All of them evaluate to "Cancelled", so they are closed and the step skips them.
+    - No formula in any tab references AJ or the text "Delivered".
+- **Evidence:**
+  - New tests `tests/test_aj_status_stages.py` (26). Before the fix: `9 failed, 17 passed`. After: the full suite gives `206 passed`.
+  - An offline projection ran the real `build_sheet_update_requests` on the 1-Nov export with an empty POD index. Result: `Counter({'Invoiced': 2004})`, plus 0 other writes.
+- **Blast radius:**
+  - Only AJ, and only on open lines whose AJ is blank or a lower stage.
+  - Expected first run: about 2,004 cells set to "Invoiced" and 0 to "Dispatched". "Delivered" works as before.
+  - The 1,036 lines with no invoice stay blank (759 without an order, 277 not invoiced).
+  - The GT_FMS dashboards still count only "Delivered".
+- **Still open:**
+  - **Not merged / not pushed** (branch `aj-status-stages`).
+  - "Dispatched" needs a real AWB source in AE. A Vinculum shipment or AWB feed is a separate decision. The Order Enquiry "Status" column is order-level and its values were not verified, so it is not used.
+  - The 214 rows with the Open Qty formula pasted into AV/AW/AX evaluate to "Cancelled", so they are harmless today. They are still a sheet-hygiene item for whoever pasted them.
+- **Related:** Virtual Invoice protection of 2026-10-09 (`tests/test_pod.py`, no record), `2026-10-31-invoiced-rows-never-filled-wrong-order-in-p.md`, `2026-10-31-ho-orders-not-in-sales-files-not-invoiced.md`, `2026-10-31-pod-status-blank-when-pick-date-blank.md`.

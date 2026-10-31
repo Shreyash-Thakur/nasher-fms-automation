@@ -46,11 +46,31 @@ COL_AP = 42      # AP = Actual
 COL_AU = 47      # AU = POD Link
 COL_AV = 48      # AV = Delivered Date
 
-# A:AV = 48 columns.
-LAST_READ_COLUMN = "AV"
+# Read-only evidence columns for the AJ stage (2026-11-01).
+COL_AE = 31      # AE = AWB
+COL_AW = 49      # AW = Invoice No
+
+# A:AW = 49 columns (AW added 2026-11-01 for the "Invoiced" stage).
+LAST_READ_COLUMN = "AW"
 
 # Value written into AJ when a POD is found.
 DELIVERED_TEXT = "Delivered"
+
+# ------------------------------------------------------------
+# AJ "Order Delivery Status" stages (2026-11-01, user decision).
+# Before, AJ was only ever "Delivered" (POD found) / "Cancelled" / "Virtual Invoice",
+# so 3,040 open lines read blank whatever their progress. Now:
+#   blank < Invoiced (AW Invoice No filled) < Dispatched (AE AWB filled) < Delivered (POD)
+# AJ is written only when it is blank or holds a LOWER stage of this ladder: never
+# downgraded, any other text (a human's note, "Returned", ...) is never replaced, and
+# closed lines (Cancelled / Virtual Invoice / OOS in C or P:AW) are never touched.
+# "Dispatched" = a real AWB in AE. AB / AG / AL "Actual" are NOT evidence: the planned-
+# status step fills them on plan from X (resolve_stage_actual), and AS Dispatched Qty
+# is the Vinculum Pick Qty of the invoice line (same source as AW).
+INVOICED_TEXT = "Invoiced"
+DISPATCHED_TEXT = "Dispatched"
+AJ_STAGE_RANK = {"": 0, INVOICED_TEXT.lower(): 1, DISPATCHED_TEXT.lower(): 2,
+                 DELIVERED_TEXT.lower(): 3}
 
 
 # ============================================================
@@ -1052,19 +1072,47 @@ def is_blank_value(value):
 # only C / P / AP were checked, so a punched Virtual Invoice line (AJ only) was
 # overwritten with "Delivered" whenever a POD file matched.
 CLOSED_MARKERS = {"cancelled", "virtual invoice", "out of stock", "oos"}
-CLOSED_MARKER_COLUMNS = [COL_GT] + list(range(COL_ORDER, COL_AV + 1))   # C, P:AV
+CLOSED_MARKER_COLUMNS = [COL_GT] + list(range(COL_ORDER, COL_AW + 1))   # C, P:AW
 
 
 def row_is_cancelled(row):
     """
     True if this row is closed (Cancelled / Virtual Invoice / Out of stock / OOS
-    in C or anywhere in P:AV — includes AJ). Closed rows are never written: not
-    AJ "Delivered", not AP / AU / AV.
+    in C or anywhere in P:AW — includes AJ). Closed rows are never written: no
+    AJ stage, not AP / AU / AV.
     """
     for column_number in CLOSED_MARKER_COLUMNS:
         if get_cell(row, column_number).strip().lower() in CLOSED_MARKERS:
             return True
     return False
+
+
+def _has_evidence(row, column_number):
+    value = get_cell(row, column_number)
+    return bool(value) and value.lower() not in CLOSED_MARKERS
+
+
+def aj_stage_for_row(row, pod_found):
+    """Highest AJ stage the row has evidence for, or "" (none).
+    Delivered = POD matched; Dispatched = AE AWB; Invoiced = AW Invoice No."""
+    if pod_found:
+        return DELIVERED_TEXT
+    if _has_evidence(row, COL_AE):
+        return DISPATCHED_TEXT
+    if _has_evidence(row, COL_AW):
+        return INVOICED_TEXT
+    return ""
+
+
+def aj_should_write(current_aj, stage):
+    """True when AJ may move to `stage`: AJ is blank or a lower stage of the ladder.
+    Unknown text (not a stage) is never replaced; equal / higher is never downgraded."""
+    if not stage:
+        return False
+    current_rank = AJ_STAGE_RANK.get(str(current_aj or "").strip().lower())
+    if current_rank is None:
+        return False
+    return current_rank < AJ_STAGE_RANK[stage.lower()]
 
 
 def build_sheet_update_requests(values):
@@ -1075,13 +1123,13 @@ def build_sheet_update_requests(values):
     - AP is updated only when currently blank.
     - AU is updated only when currently blank.
     - AV is updated only when currently blank.
-    - AJ (Order Delivery Status) is set to "Delivered" ONLY when a real
-      POD is found for the row AND the row is not Cancelled. It is never
-      written for a Cancelled order, and not rewritten if it already
-      reads "Delivered".
+    - AJ (Order Delivery Status) moves up the stage ladder
+      blank < "Invoiced" (AW) < "Dispatched" (AE AWB) < "Delivered" (POD)
+      (2026-11-01). "Delivered" ONLY when a real POD is found. Never written
+      on a closed row (Cancelled / Virtual Invoice / OOS in C or P:AW), never
+      downgraded, never over a non-stage text.
     - Existing manual values are NEVER overwritten (except AJ, which is
-      promoted to "Delivered" on a confirmed POD, since a found POD is
-      authoritative proof of delivery).
+      promoted to a higher stage).
     """
     rows_checked = 0
     matched = 0
@@ -1115,6 +1163,14 @@ def build_sheet_update_requests(values):
 
         if pod is None:
             missed += 1
+            # 2026-11-01: no POD -> AJ "Invoiced" / "Dispatched" from AW / AE.
+            if not row_is_cancelled(row):
+                stage = aj_stage_for_row(row, pod_found=False)
+                if aj_should_write(get_cell(row, COL_AJ), stage):
+                    updates.append({
+                        "range": f"'{SHEET_NAME}'!AJ{row_num}",
+                        "values": [[stage]],
+                    })
             continue
 
         matched += 1
@@ -1178,10 +1234,10 @@ def build_sheet_update_requests(values):
         # AJ = Order Delivery Status -> "Delivered".
         #
         # A POD was matched for this row, so it is genuinely delivered.
-        # Guard against Cancelled orders (their cells read "Cancelled",
-        # which must never become "Delivered"), and skip the write if
-        # AJ already reads "Delivered".
-        if current_aj != DELIVERED_TEXT:
+        # Closed rows were skipped above. Written over blank / "Invoiced" /
+        # "Dispatched" only (aj_should_write): not rewritten when AJ already
+        # reads "Delivered", and a non-stage text in AJ is left alone.
+        if aj_should_write(current_aj, DELIVERED_TEXT):
             updates.append({
                 "range": f"'{SHEET_NAME}'!{aj_cell}",
                 "values": [[DELIVERED_TEXT]],
@@ -1201,7 +1257,7 @@ def build_sheet_update_requests(values):
 
 def apply_sheet_updates(sheets, updates):
     if not updates:
-        print("\nNo blank AJ/AP/AU/AV cells needed updating.")
+        print("\nNo AJ/AP/AU/AV cells needed updating.")
         return 0
 
     print()
@@ -1247,7 +1303,8 @@ def main():
         "Update columns: AJ (Order Delivery Status), AP (Actual), "
         "AU (POD Link), AV (Delivered Date)"
     )
-    print("AJ is set to 'Delivered' only on a confirmed POD, never for Cancelled orders.")
+    print("AJ stages: Invoiced (AW) < Dispatched (AE AWB) < Delivered (confirmed POD); "
+          "only over blank / a lower stage, never on Cancelled / Virtual Invoice / OOS rows.")
     print("Existing non-blank values will NOT be overwritten.")
 
     # ========================================================
@@ -1319,10 +1376,14 @@ def main():
     # FINAL SUMMARY
     # ========================================================
 
-    aj_updated = sum(
-        1 for item in updates
-        if "'Full Flow FMS'!AJ" in item["range"]
-    )
+    aj_by_stage = {
+        stage: sum(
+            1 for item in updates
+            if "'Full Flow FMS'!AJ" in item["range"] and item["values"][0][0] == stage
+        )
+        for stage in (DELIVERED_TEXT, DISPATCHED_TEXT, INVOICED_TEXT)
+    }
+    aj_updated = aj_by_stage[DELIVERED_TEXT]
 
     ap_updated = sum(
         1 for item in updates
@@ -1358,6 +1419,8 @@ def main():
     print("-" * 80)
 
     print(f"AJ marked Delivered      : {aj_updated:,}")
+    print(f"AJ marked Dispatched     : {aj_by_stage[DISPATCHED_TEXT]:,} (AE AWB, no POD)")
+    print(f"AJ marked Invoiced       : {aj_by_stage[INVOICED_TEXT]:,} (AW Invoice No, no POD / AWB)")
     print(f"AP updated               : {ap_updated:,}")
     print(f"AU links updated         : {au_updated:,}")
     print(f"AV updated               : {av_updated:,}")
