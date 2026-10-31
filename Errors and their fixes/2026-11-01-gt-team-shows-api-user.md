@@ -1,0 +1,43 @@
+# GT Full Flow Q "Team" shows the Vinculum API user instead of the ops person
+
+- **Date:** 2026-11-01
+- **Reported as:** "the issue with team in GT is that its giving diwakar's name but it needs to be ops team who punched the order on the form coz diwakar is the api key name"
+- **Symptom:** in GT Full Flow FMS, tab "Full Flow FMS", Q (Team) reads "Diwakar" on about 345 October rows. Those are orders punched through the auto-punch portal.
+- **Where:** `scripts/gt_full_flow_fms_yes_no_all_or_latest.py`. Q had five write paths, and every one copied the Vinculum "Created by" value:
+  - `build_full_flow` (append path), Sales Master line: `output_row["Team"] = sales_row["Created by"]`.
+  - `build_full_flow` (append path), daily Order Enquiry record: `oe_rec["team"]`.
+  - `plan_existing_writes`, Sales Master fill/refresh: `BACKFILL_FIELDS` entry `("Team", lambda s, wh: s["Created by"])`.
+  - `_oe_cells`, a blank-P row filled from the daily Order Enquiry.
+  - `_order_no_cells`, a row whose P is filled but not invoiced (Q from Order Enquiry).
+- **Root cause:**
+  - The portal punches orders into Vinculum through an API key that belongs to the user "Diwakar".
+  - Vinculum records the key's owner as "Created by" on those orders, so the job wrote "Diwakar" into Q.
+  - The ops person who actually punched the GT is known only to the portal.
+- **Why it wasn't caught:**
+  - Before 12-Oct, orders were punched by hand in Vinculum, so "Created by" really was the ops person.
+  - The fill-rate table only counts filled cells, so "Diwakar" counted as a good value.
+  - No test covered an API-user "Created by".
+- **Fix:**
+  - New `API_USER_NAMES = {"diwakar"}`. Names are compared lower-case with all whitespace removed (`is_api_user`).
+  - `fill_value_ok(column, value)`: an API-user name is never written into Q, on every path above. The rest of the row still fills.
+  - `cell_open(column, current)`: Q is filled only when it is blank or holds an API-user name. A real name in Q, such as the one the portal writes, is never overwritten. Other columns keep the old rule (blank cells only).
+  - The append path writes Q only from a non-API-user "Created by", otherwise Q stays blank.
+  - The fill-rate table (`_print_fill_rates`) counts an API-user Q as blank.
+  - Existing "Diwakar" cells are **not** blanked by this job. The portal backfill replaces them with the real ops name.
+  - There is no full-rebuild mode in this script. Existing rows are touched only by the blank-cell fill, and appends cover only GT+SKU lines that are not in Full Flow yet.
+- **Evidence:**
+  - New tests `tests/test_team_api_user.py` (20). Before the fix: `18 failed, 2 passed`.
+  - After the fix, the full suite gives `226 passed` (206 before plus the 20 new tests).
+- **Blast radius:**
+  - Only Q (Team).
+  - From tonight, no new "Diwakar" is written into Q. Portal-punched orders keep Q blank until the portal writes the ops name.
+  - Existing "Diwakar" cells are left as they are. If Vinculum has a real "Created by" for such an order, it replaces "Diwakar". For portal orders that does not happen, because their "Created by" is "Diwakar" too.
+  - The fill-rate Q column drops by the number of "Diwakar" rows. That is a display change only.
+- **Still open:**
+  - **Not merged / not pushed** (branch `team-no-api-user`).
+  - The portal must write the real ops name into Q at punch time and backfill the existing "Diwakar" rows. A separate agent owns that.
+  - If another API key user is added, add the name to `API_USER_NAMES`.
+  - There is a small race: the job reads Q as "Diwakar", the portal writes the real name, then the job writes a different real "Created by" over it. This needs a non-API "Created by" on a portal order, so it is not expected.
+- **Related:**
+  - `Errors and their fixes/2026-10-10-order-no-blank-until-invoiced.md` (the Order Enquiry fill paths).
+  - `Errors and their fixes/2026-10-31-invoiced-rows-never-filled-wrong-order-in-p.md` (the `refresh_other_order` path, which also writes Q).

@@ -226,7 +226,7 @@ def normalize_customer_code(value):
 # Matching key: ExtOrderNo (column C) + SKU Code (column W)
 # Output mappings:
 #   Order No   <- column A            -> Full Flow P
-#   Team       <- Created by          -> Full Flow Q
+#   Team       <- Created by          -> Full Flow Q (never an API_USER_NAMES name)
 #   Actual     <- Order Date          -> Full Flow S
 #   Invoice No <- Invoice No          -> Full Flow AW
 #   Invoice Amount <- Total           -> Full Flow AY
@@ -1108,6 +1108,39 @@ def value_found(value):
     except Exception:
         pass
     return str(value).replace("\xa0", " ").strip() != ""
+
+
+# ------------------------------------------------------------
+# Q (Team) and the Vinculum API user  -  2026-11-01.
+# Orders punched through the auto-punch portal reach Vinculum via the API key of these
+# users, so their "Created by" is the key's owner, not the ops person who punched the
+# GT. Such a name is "no team info": never written into Q, and a Q holding it counts as
+# blank (a real Created-by name may replace it; the portal backfills the real ops name).
+# Compared lower-case with all whitespace removed. Record:
+# "Errors and their fixes/2026-11-01-gt-team-shows-api-user.md".
+# ------------------------------------------------------------
+API_USER_NAMES = {"diwakar"}
+TEAM_COLUMN = "Team"
+
+
+def _name_key(value):
+    return "".join(str(value).split()).lower()
+
+
+def is_api_user(value):
+    """True when value is one of API_USER_NAMES (case/space-insensitive)."""
+    return value_found(value) and _name_key(value) in {_name_key(n) for n in API_USER_NAMES}
+
+
+def cell_open(column, current):
+    """True when the nightly job may fill this cell: blank, or (Q only) an API-user name."""
+    return not value_found(current) or (column == TEAM_COLUMN and is_api_user(current))
+
+
+def fill_value_ok(column, value):
+    """True when value may be written into column: present, and not an API user in Q."""
+    return value is not None and value_found(value) and \
+        not (column == TEAM_COLUMN and is_api_user(value))
 
 
 # ============================================================
@@ -2059,7 +2092,8 @@ def build_full_flow(fms_df, assigned, pick_pack_lookup, warehouse_mapping, oe_re
 
                 # Order Enquiry -> Full Flow mappings
                 output_row["Order No"] = sales_row["Order No"]        # P
-                output_row["Team"] = sales_row["Created by"]          # Q
+                if fill_value_ok("Team", sales_row["Created by"]):    # Q (never the API user)
+                    output_row["Team"] = sales_row["Created by"]
                 output_row["Actual"] = sales_row["Order Date"]        # S
                 output_row["Invoice No"] = sales_row["Invoice No"]    # AW
                 output_row["Invoice Amount"] = sales_row["Total"]     # AY
@@ -2089,7 +2123,7 @@ def build_full_flow(fms_df, assigned, pick_pack_lookup, warehouse_mapping, oe_re
                 for column, key in (("Order No", "order_no"), ("Actual", "order_date"),
                                     ("Team", "team")):
                     value = oe_rec.get(key)
-                    if value is not None and value_found(value) and not value_found(output_row[column]):
+                    if fill_value_ok(column, value) and cell_open(column, output_row[column]):
                         output_row[column] = value
             outputs = [output_row]
 
@@ -2168,6 +2202,9 @@ def build_full_flow(fms_df, assigned, pick_pack_lookup, warehouse_mapping, oe_re
 #  - 2026-10-12: P (Order No) reads "Cancelled" on rows whose status is Cancelled and whose
 #    P is blank (easy reference; a real Order No is kept); cleared again if the status is
 #    reverted. See plan_cancelled_order_no().
+#  - 2026-11-01: Q (Team) showed "Diwakar" (the Vinculum API key user) on portal-punched
+#    orders. API_USER_NAMES are never written into Q; Q is filled only when blank or
+#    holding an API-user name, so the real ops name the portal writes is never replaced.
 #
 # BACKFILL_MODE env: "write" (default in CI), "dry-run" (log only, this script writes
 # NOTHING — no fills, no appends), "off" (no fills; appends as before).
@@ -2603,7 +2640,7 @@ def _oe_cells(row, record, order_key, pick_pack_lookup, sheet_row):
     cells = []
     for column, key in (("Order No", "order_no"), ("Actual", "order_date"), ("Team", "team")):
         value = record.get(key)
-        if value is not None and value_found(value) and not value_found(row[column]):
+        if fill_value_ok(column, value) and cell_open(column, row[column]):
             cells.append((sheet_row, column, value, "oe_fill"))
     cells += _pick_pack_cells(row, order_key, pick_pack_lookup, sheet_row, "oe_fill")
     return cells
@@ -2628,7 +2665,7 @@ def _order_no_cells(row, orders, oe_index, pick_pack_lookup, sheet_row):
         first = min(found, key=lambda r: pd.Timestamp(r["order_date"]))
         for column, key in (("Actual", "order_date"), ("Team", "team")):
             value = first.get(key)
-            if value is not None and value_found(value) and not value_found(row[column]):
+            if fill_value_ok(column, value) and cell_open(column, row[column]):
                 cells.append((sheet_row, column, value, "oe_refresh"))
 
     if len(orders) == 1:
@@ -2711,7 +2748,7 @@ def plan_existing_writes(existing_df, slots, lines, pick_pack_lookup, warehouse_
         row_cells = []
         for column, getter in BACKFILL_FIELDS:
             value = getter(sale, warehouse_mapping)
-            if value is not None and value_found(value) and not value_found(row[column]):
+            if fill_value_ok(column, value) and cell_open(column, row[column]):
                 row_cells.append((sheet_row, column, value, reason))
 
         row_cells += _pick_pack_cells(row, normalize_value(sale["Order No"]),
@@ -3073,7 +3110,8 @@ def _print_fill_rates(existing_df, writes=None):
     print(header)
     for month in sorted(months.unique()):
         part = open_rows[months == month]
-        counts = [int(part[c].map(value_found).sum()) for c in FILL_RATE_COLUMNS]
+        counts = [int(part[c].map(lambda v, c=c: not cell_open(c, v)).sum())
+                  for c in FILL_RATE_COLUMNS]          # an API-user Q counts as blank
         print(f"{month:<8}{len(part):>6} " + " ".join(f"{n:>5}" for n in counts))
 
 
