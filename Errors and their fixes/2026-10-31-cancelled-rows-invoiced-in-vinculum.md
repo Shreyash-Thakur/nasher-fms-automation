@@ -1,0 +1,39 @@
+# 206 Full Flow rows read "Cancelled" in P:AW although Vinculum invoiced them (not auto-reverted; ops review list)
+
+- **Date:** 2026-10-31
+- **Reported as:** "Im seeing so many gaps in the fms." Then: "whatever's mentioned in the screenshots try to fill as many as you can use the vin api any source you want".
+- **Symptom:**
+  - 206 rows have "Cancelled" in every cell of P:AW, so they count as closed and are never filled.
+  - Their GT + SKU has an invoiced Vinculum line. They are `reports/suspect_cancellations.csv` of the 23-Oct run.
+  - All 206 still read Cancelled in the 31-Oct export, and none moved.
+  - 13 GTs, 11 orders. By form month: Apr 127, May 8, Jun 70, Jul 1.
+  - The largest: GT140426A10R/T, N051446, invoice 27/04/NM7/1786, 127 rows. GT150626A2R/T, N051516, 27/06/NM7/2681, 55 rows. GT090626A2R/T, N051514, 27/06/NM7/2570, 14 rows.
+- **Where:**
+  - `scripts/gt_full_flow_fms_yes_no_all_or_latest.py`: `row_is_closed` / `CLOSED_MARKERS` skip the rows (by design), and `report_suspect_cancellations` lists them, read-only.
+  - The "Cancelled" values come from GT_FMS dashboard Cancel GT, which writes "Cancelled" into P:AW.
+- **Root cause:**
+  - Every one of the 206 rows has "Cancelled" in **all** of P:AW. That is the dashboard / manual Cancel-GT pattern.
+  - It is **not** the old historical auto-cancel (T:AW with P blank), which the audit had suspected.
+  - The GT was cancelled in the FMS, but Vinculum still shipped and invoiced its order (ExtOrderNo = the same GT base).
+  - The job treats any "Cancelled" as a human decision and never writes such rows.
+- **Why it wasn't caught:** the report has been produced every night since 2026-10-09, but only as a workflow artifact. Nobody owns the decision.
+- **Fix:** none automatic, by request: do NOT auto-uncancel.
+  - Ops review list: `C:\Users\shrey\AppData\Local\Temp\claude\C--Users-shrey-Desktop-Diwakar-Handoff\1c6bae12-e921-444c-a8ce-77709cf00265\scratchpad\gaps31\gt_cancelled_but_invoiced_for_ops_review.csv`.
+  - Columns: sheet_row, gt_number, vinculum_sku, vinculum_order_nos, vinculum_invoice_nos, invoiced_in_vinculum, how_cancelled, form_received, row_unchanged_since_23oct, still_cancelled_31oct, current P/T/AJ/AW, and an empty "ops_decision (UNCANCEL / KEEP CANCELLED)".
+  - **Opt-in fix, described here, not built:**
+    - Add a workflow input `uncancel_rows_csv` (Drive file ID of the reviewed CSV, default empty = off).
+    - The job takes only rows marked UNCANCEL that are still in tonight's `suspect_cancellations` list with the same sheet_row + GT + SKU.
+    - It refuses all of them if more than 250, or if any listed row no longer matches.
+    - It clears "Cancelled" from P:AW of those rows in the same run, before planning. The normal blank-cells fill then writes P/Q/S/AS/AW/AX/AY from the invoiced line.
+    - It logs each row to the GT_FMS "❌ CANCELLATIONS" ledger as "uncancelled (invoiced in Vinculum)".
+    - Dry-run mode prints the plan without writing.
+    - Alternative without code: ops undo the cancel in the sheet. The next nightly run fills the rows, because blank cells are filled and "Cancelled" is no longer there.
+- **Evidence:**
+  - From the 23-Oct `suspect_cancellations.csv`: `206` rows; pattern `dashboard/manual cancel (P:AW) 206`; invoiced `yes 206`.
+  - Against the 31-Oct export: `row_unchanged_since_23oct yes 206`, `still_cancelled_31oct yes 206`, and the "Cancelled" columns are `Counter({'P:AW all': 206})`.
+- **Blast radius:** nothing is written. The CSV is for a human decision.
+- **Still open:**
+  - The ops decision per GT.
+  - The opt-in input above, if ops want the job to do the uncancel.
+  - **Not merged to main** (branch `fill-gaps-31oct`, record only).
+- **Related:** `2026-10-09-full-flow-rows-empty-suffix-and-refresh.md` (report_suspect_cancellations), `plan_cancelled_order_no` (Order No "Cancelled" sentinel, 2026-10-12), GT_FMS `Code.js` Cancel GT.

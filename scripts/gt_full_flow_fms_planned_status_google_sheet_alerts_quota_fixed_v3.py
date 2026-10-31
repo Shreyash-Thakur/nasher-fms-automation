@@ -363,6 +363,39 @@ def process_stage(
     return status
 
 
+# Offsets of the internal stages between X (pick) and AO (POD planned), in order:
+# AA = X + 30m, AF = AB + 6h, AK = AG + 30m, AO = AL + 24h.
+STAGE_OFFSETS_AFTER_X = (
+    timedelta(minutes=30), timedelta(hours=6), timedelta(minutes=30), timedelta(hours=24))
+
+
+def stage6_planned(row_values, actual_AL, holidays):
+    """Planned AO for the POD stage -> (datetime, basis) or (None, None).
+
+    Normal: AO = AL + 24h (basis "AL").
+    2026-10-31 fallback: X (Pick Actual) blank, so the chain X -> AB -> AG -> AL never
+    ran, but AP (POD date) is a date. Without AO, AQ/AR stayed blank on 198 rows that
+    have a POD. The next known EARLIER date of the row stands in for X: S (punch date),
+    else A (form received). AO = that date + 30m + 6h + 30m + 24h, each step skipping
+    holidays exactly like the chain (basis "S" / "A"). AA..AL are NOT written, and a
+    row without a POD date gets no AO from a guess.
+    """
+    if actual_AL is not None:
+        return add_time_skip_holidays(actual_AL, timedelta(hours=24), holidays), "AL"
+    if to_datetime(get_value(row_values, COL_X)) is not None:
+        return None, None
+    if to_datetime(get_value(row_values, COL_AP)) is None:
+        return None, None
+    for column, basis in ((COL_S, "S"), (COL_FORM_RECEIVED, "A")):
+        planned = to_datetime(get_value(row_values, column))
+        if planned is None:
+            continue
+        for delta in STAGE_OFFSETS_AFTER_X:
+            planned = add_time_skip_holidays(planned, delta, holidays)
+        return planned, basis
+    return None, None
+
+
 def resolve_stage_actual(row_values, col_actual, planned_dt, row, updates):
     """Return the Actual datetime to use for an internal handoff stage.
 
@@ -954,7 +987,8 @@ def main():
     stage3_planned = 0
     stage4_planned = 0
     stage5_planned = 0
-    stage6_planned = 0
+    stage6_planned_count = 0
+    stage6_fallback_count = 0
 
     status_counts = {
         "Early": 0,
@@ -1187,15 +1221,12 @@ def main():
         # Final stage. AP is a REAL external actual (delivery / POD) and
         # is NOT auto-filled. Status/Time Delay (AQ/AR) are computed only
         # when AP already has a value.
+        # X blank + POD date present: AO from S (else A), see stage6_planned.
         # ====================================================
 
-        if actual_AL is not None:
+        planned_AO, ao_basis = stage6_planned(row_values, actual_AL, holidays)
 
-            planned_AO = add_time_skip_holidays(
-                actual_AL,
-                timedelta(hours=24),
-                holidays,
-            )
+        if planned_AO is not None:
 
             process_stage(
                 row_values,
@@ -1210,7 +1241,9 @@ def main():
                 main_sheet_id,
             )
 
-            stage6_planned += 1
+            stage6_planned_count += 1
+            if ao_basis != "AL":
+                stage6_fallback_count += 1
 
         if rows_processed % 500 == 0:
             print(
@@ -1265,7 +1298,8 @@ def main():
         f"AK planned              : {stage5_planned:,}"
     )
     print(
-        f"AO planned              : {stage6_planned:,}"
+        f"AO planned              : {stage6_planned_count:,}"
+        f"  (of which X blank, from S/A: {stage6_fallback_count:,})"
     )
 
     print("-" * 80)
