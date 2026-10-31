@@ -1,0 +1,39 @@
+# AQ/AR (POD Status / Time Delay) stay blank on rows with a POD whenever X (Pick Actual) is blank
+
+- **Date:** 2026-10-31
+- **Reported as:** "Im seeing so many gaps in the fms." Then: "whatever's mentioned in the screenshots try to fill as many as you can use the vin api any source you want".
+- **Symptom:** in the 31-Oct export, 198 open rows have a POD date (AP) but a blank AQ and AR. Their X (warehouse pick Actual) is blank. Examples: 6465-6477 GT190826A1 (POD 24-Aug), 8668 GT191026A2R N012278 and 8727 GT191026A8.
+- **Where:** `scripts/gt_full_flow_fms_planned_status_google_sheet_alerts_quota_fixed_v3.py`, `main()` stage 6. Before the fix it only ran `if actual_AL is not None:`; now the logic is `stage6_planned` (line 372), called at line 1227.
+- **Root cause:**
+  - Planned AO is AL + 24h. AL exists only through the chain X → AB (+30m) → AG (+6h) → AL (+30m).
+  - When X is blank, the chain never starts, so AO is never planned. `process_stage` then returns before computing AQ/AR, even though AP holds a real POD date.
+  - X is blank for reasons outside this script:
+    - N10 / HO orders are not in the Pick Pack export.
+    - The missing PickPackReport_20.08.2026: see `2026-10-31-pick-date-blank-gt190826-gt200826.md`.
+    - The job outage of 23-30 Oct.
+- **Why it wasn't caught:**
+  - The status step prints only "AO planned: n". It has no count of rows that have a POD but no AO.
+  - There were no tests for this script.
+- **Fix (exact rule):**
+  - Normal rows are unchanged: AO = AL + 24h.
+  - Fallback, only when **X is blank and AP parses as a date**:
+    - The next known earlier date of the row stands in for X: **S (punch date), else A (form received)**.
+    - AO = that date + 30m + 6h + 30m + 24h. Each step skips holidays (`add_time_skip_holidays`), exactly like the normal chain with on-plan internal stages.
+    - AO is written if blank, and AQ/AR are computed from AP versus that AO (same Early / On Time / Delay rules).
+  - AA..AL (internal stage actuals) are **not** written.
+  - A row without a POD date gets no AO from the fallback.
+  - The invoice date is not a column of Full Flow, so it is not used.
+  - The run log line now reads "AO planned: n (of which X blank, from S/A: m)".
+- **Evidence:**
+  - Offline (31-Oct export; the real `stage6_planned` + `process_stage`; no holidays loaded; nothing written): open rows with X blank: `Counter({(None, True): 1300, ('S', True): 121, ('A', True): 77})`. That is 198 rows that now get AO/AQ/AR, the same as the audit count, and the 1,300 rows without a POD get nothing.
+  - Sample: `(6465, 'GT190826A1', 'S', '24-Aug-2026 00:00:00', ['20-Aug-2026 07:00:00', 'Delay', '3d 17h 00m 00s'])`.
+  - New tests `tests/test_pod_status_fallback.py` (9). Before the fix: `9 failed`. After: the full suite gives `180 passed`.
+- **Blast radius:**
+  - Only rows with X blank and a POD date: AO (if blank), AQ and AR.
+  - Rows with X are computed exactly as before.
+  - No other column is touched.
+- **Still open:**
+  - **Not merged to main** (branch `fill-gaps-31oct`).
+  - AO is written only when blank, so a row that later gets X keeps the fallback AO in the cell. AQ/AR are then recomputed from the X-based plan every run (the same "Planned only when blank" behaviour every stage has).
+  - The status step computes AQ/AR for every row on every run. The 916 rows whose POD arrived after the last successful run (23-Oct) are filled by the next run anyway.
+- **Related:** `2026-10-31-pick-date-blank-gt190826-gt200826.md`, `2026-10-23-portal-punched-rows-never-get-punch-date.md`, audit `gaps31/gt_audit.md` (AQ/AR row).
