@@ -1223,6 +1223,42 @@ def parse_pick_date(value):
         return pd.NaT
 
 
+# 2026-11-11: the Pick Pack Google Sheets for 03-12 Jul 2026 were made by importing the
+# dd/mm/yyyy Vinculum CSV with a US locale, so every Pick Date whose day was <= 12 became
+# a REAL date cell with month and day swapped (PickPackReport_12.07.2026: all 1,148 cells
+# = 07-Dec-2026, format mm/dd/yyyy). Days > 12 stayed dd/mm text and parse fine. The
+# export gives "2026-12-07 14:48:00", which parse_pick_date correctly reads year-first,
+# so X got 07-Dec. A report never holds picks after its own date, so a pick outside
+# [report date - PICK_SWAP_WINDOW_DAYS, report date + 1] whose swap lands inside is the
+# swap and is undone. Anything else (no report date, day > 12, both outside) is kept.
+PICK_SWAP_WINDOW_DAYS = 31
+
+
+def fix_swapped_pick_date(value, report_date):
+    """(pick date, swapped?) - value with month/day swapped back when report_date
+    proves it was swapped by the Sheets import; else (value, False)."""
+    if value is None or report_date is None:
+        return value, False
+    try:
+        if pd.isna(value) or pd.isna(report_date):
+            return value, False
+    except (TypeError, ValueError):
+        return value, False
+    ts = pd.Timestamp(value)
+    report = pd.Timestamp(report_date).date()
+    low = report - timedelta(days=PICK_SWAP_WINDOW_DAYS)
+    high = report + timedelta(days=1)
+    if low <= ts.date() <= high or ts.day > 12 or ts.day == ts.month:
+        return value, False
+    try:
+        swapped = ts.replace(month=ts.day, day=ts.month)
+    except ValueError:
+        return value, False
+    if low <= swapped.date() <= high:
+        return swapped, True
+    return value, False
+
+
 # ============================================================
 # SALES / ORDER ENQUIRY FROM GOOGLE DRIVE
 # ============================================================
@@ -1660,6 +1696,9 @@ def read_pick_pack_files():
             continue
 
         df = df.dropna(how="all")
+        # The report's own date (from its name) lets build_pick_pack_lookup undo a
+        # month/day swap made by the Sheets import (see fix_swapped_pick_date).
+        df["_FILE_DATE"] = file_report_date(name)
         dataframes.append(df)
         RUN_HEALTH.read("pick_pack", name, len(df))
         print(f"Read: {name} [{kind}] -> {len(df):,} rows")
@@ -1998,6 +2037,14 @@ def build_pick_pack_lookup(pick_pack_df):
     print("Parsing Pick Pack Pick Date...")
     pick_pack_df["_RAW_PICK_DATE"] = pick_pack_df["Pick Date"]
     pick_pack_df["Pick Date"] = pick_pack_df["Pick Date"].apply(parse_pick_date)
+    if "_FILE_DATE" in pick_pack_df.columns:
+        fixed = [fix_swapped_pick_date(d, f) for d, f in
+                 zip(pick_pack_df["Pick Date"], pick_pack_df["_FILE_DATE"])]
+        swapped = sum(1 for (_, was), d in zip(fixed, pick_pack_df["Pick Date"]) if was)
+        pick_pack_df["Pick Date"] = [d for d, _ in fixed]
+        if swapped:
+            print(f"Pick Dates with month/day swapped by the Sheets import, corrected: "
+                  f"{swapped:,}")
 
     valid_pick_dates = pick_pack_df["Pick Date"].notna().sum()
     print(f"Valid Pick Dates: {valid_pick_dates:,}")

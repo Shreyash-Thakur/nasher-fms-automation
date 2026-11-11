@@ -1,0 +1,35 @@
+# GT Full Flow X (Pick Actual) had month and day swapped for picks of 03-12 Jul 2026
+
+- **Date:** 2026-11-11
+- **Reported as:** "future dates in col X with day and month swapped", e.g. GT100726A3 row 5431 X = 07-Dec-2026, probably 12-Jul-2026.
+- **Symptom:**
+  - GT Full Flow FMS (`1jMEEFkAVfg7NHtxj3QCYuNY_V-AhU00ljQeRYTBQDio`, tab "Full Flow FMS", header row 7), export of 2026-11-11: **295 X cells on 25 GTs, rows 4371-5433**, hold a swapped pick date. The true picks are 03-12 Jul 2026.
+    - 2 are in the future (X5431 GT100726A3 07-Dec-2026 → 12-Jul; X5433 GT110726A1 07-Dec → 12-Jul).
+    - 56 are before the order (GT030726A1/A2, GT040726A1R/A1T/A4: 07-Mar..07-Jun → 03..06-Jul).
+    - 237 are more than 30 days after the order (07-Aug..07-Nov → 08..11-Jul; GT070726A2..A11T, GT080726A1-3, GT100726A1-3, GT230626A6).
+  - The planned-status job chains AA/AF/AK/AO off X, so those Planned cells and Y/Z ("Delay", "147d 14h 48m 00s" on row 5431) are wrong on the same rows.
+- **Where:** data from `PickPackReport_03.07.2026` .. `PickPackReport_12.07.2026` (Drive folder 1Xi66o4A0I3GdtlNrh61XcEWNkT5UKmey), read by `read_pick_pack_files` → `build_pick_pack_lookup` → `parse_pick_date` (ISO branch, `scripts/gt_full_flow_fms_yes_no_all_or_latest.py`, ~line 1197-1218 at 2ab9339) → `_pick_pack_cells` writes X.
+- **Root cause:** those Pick Pack Google Sheets were created by importing the dd/mm/yyyy Vinculum CSV with a US locale, so every Pick Date with day ≤ 12 became a real date cell with month and day swapped, and the job trusted real date cells as-is.
+  - `PickPackReport_12.07.2026`: all 1,148 Pick Date cells are real dates = 2026-12-07 with format `mm/dd/yyyy h:mm am/pm`; order O9486 (GT100726A3) = 2026-12-07 14:48.
+  - Days > 12 could not be read month-first, so they stayed dd/mm text and parsed correctly (`PickPackReport_13.07.2026`: 740 text cells "13/07/2026 ..."). Recent files are text too (`PickPackReport_07.11.2026`: 560 text cells "07/11/2026 ...").
+  - The xlsx export turns a real date cell into ISO text "2026-12-07 14:48:00"; `parse_pick_date` correctly reads ISO year-first, so it faithfully copied the swap.
+  - The write side is not at fault: X is written as `"%d-%b-%Y %H:%M:%S"` (`clean_for_google`) with USER_ENTERED; a month name cannot be re-read month-first.
+  - X is filled blank-only, so the bad values were written once (July) and never corrected.
+- **Why it wasn't caught:** no check compares a Pick Date with the report it came from or with the order date; the values were valid dates, and only 2 of 295 were in the future. No test covered a real date cell that was itself wrong.
+- **Fix (nasher-fms-automation, branch `fix/pick-date-day-month-swap`, fast-forwarded to `main`):**
+  - `read_pick_pack_files` stores each file's report date (`file_report_date(name)`) in `_FILE_DATE`.
+  - New `fix_swapped_pick_date(value, report_date)`: a report never holds picks after its own date, so a pick outside [report date − 31 d, report date + 1 d] whose month/day swap lands inside is swapped back. Day > 12, day == month, no report date, or both outside: unchanged.
+  - `build_pick_pack_lookup` applies it after parsing and logs `Pick Dates with month/day swapped by the Sheets import, corrected: N`. The "latest Pick Date per order" is therefore also chosen from corrected dates.
+  - New `scripts/repair_swapped_pick_dates.py`, **dry run by default** (CSV `reports/swapped_dates_repair.csv`). It reads A:X UNFORMATTED (date serials, no locale). Reason rule: day ≤ 12 AND swapped date in [order date, order date + 30 d] AND current value in the future or before the order date (order date = A, else S). Cells more than 30 d after the order are listed as `late_over_30d` and changed only with `--include-late`. `--apply` first writes a NEW tab "Swapped Dates Backup <stamp>" (cell, old, new, reason), then writes date serials with RAW. `--columns X,S` also checks S.
+- **Evidence:**
+  - Offline run of the repair logic on the 2026-11-11 export (10,299 rows read): `X before_order: 56 cells, 5 GTs, rows 5042-5170, proposed 03-Jul-2026 .. 06-Jul-2026`; `X future: 2 cells, 2 GTs, rows 5431-5433, proposed 12-Jul-2026`; `X late_over_30d: 237 cells, 19 GTs, rows 4371-5432, proposed 08-Jul-2026 .. 11-Jul-2026`; `Cells --apply would change: 58` (295 with `--include-late`). GT100726A3: X5431 07-Dec-2026 14:48 → 12-Jul-2026 14:48 (future); X5430/X5432 07-Nov-2026 15:46 → 11-Jul-2026 15:46 (late).
+  - Not flagged (correct): 39 cells GT100926A1 X = 10-Sep-2026 with order 10-Sep (both readings plausible, real seconds → left alone).
+  - New tests `tests/test_pick_date_swap.py` (17): the swap rule on the real cases (07-Dec in the 12.07 file → 12-Jul, 07-Mar in the 03.07 file → 03-Jul), untouched cases, an end-to-end 12.07 / 13.07 Sheet export through `read_pick_pack_files` + `build_pick_pack_lookup`, the month-name write format, the repair reason rule, serial round-trip, dry run makes no Sheets writes, `--apply` adds the backup tab before writing.
+  - Full suite: `258 passed in 1.26s` (241 before, plus 17 new).
+- **Blast radius:** X on rows whose pick was 03-12 Jul 2026 (295 cells, 25 GTs) plus everything chained off X on those rows: Y/Z, AA/AF/AK/AO Planned, and statuses. The fix changes only future fills of blank X; existing cells change only via the repair script.
+- **Still open:**
+  - **Historic repair awaits owner approval:** `python scripts/repair_swapped_pick_dates.py` (dry run), then `--apply` (58 cells) or `--apply --include-late` (295 cells). The planned-status job recomputes Y/Z and AA/AF/AK/AO on its next run.
+  - **S (Order Date) has the same pattern from another writer:** 75 cells, 6 GTs, all date-only (00:00), e.g. GT010426A1 S8 04-Jan-2026 → 01-Apr-2026 (41 cells, before order: GT010426A1, GT030826A1) and 34 late cells (GT060426A5, GT060426A10, GT070426A3, GT110526A2). The nightly job writes S with a time of day, so these look manual/date-only; writer not identified. `--columns X,S` lists them; W (S + 24h) is wrong on those rows too.
+  - The same US-locale import could hit Order Enquiry sheets (S via `parse_oe_date` → `parse_pick_date`); not seen in the data, not guarded.
+  - Whoever imports the Pick Pack CSVs into Sheets should import as text or with an India (dd/mm) locale.
+- **Related:** `2026-10-10-pick-pack-google-sheets-skipped.md`, `2026-10-31-pick-date-blank-gt190826-gt200826.md`, `2026-11-11-fabricated-stage-actuals.md`; punch portal `punch_gt_pickdate.js` (writes X from Vinculum shipdetail since 1-Nov, parses dd/mm explicitly; not involved).
