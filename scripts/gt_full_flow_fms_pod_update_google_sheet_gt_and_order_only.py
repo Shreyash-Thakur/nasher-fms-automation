@@ -64,8 +64,9 @@ DELIVERED_TEXT = "Delivered"
 # AJ is written only when it is blank or holds a LOWER stage of this ladder: never
 # downgraded, any other text (a human's note, "Returned", ...) is never replaced, and
 # closed lines (Cancelled / Virtual Invoice / OOS in C or P:AW) are never touched.
-# "Dispatched" = a real AWB in AE. AB / AG / AL "Actual" are NOT evidence: the planned-
-# status step fills them on plan from X (resolve_stage_actual), and AS Dispatched Qty
+# "Dispatched" = a real AWB in AE. AB / AG / AL "Actual" are NOT evidence: until
+# 2026-11-11 the planned-status step filled them on plan from X (historic rows still
+# hold those values, see audit_fabricated_actuals.py), and AS Dispatched Qty
 # is the Vinculum Pick Qty of the invoice line (same source as AW).
 INVOICED_TEXT = "Invoiced"
 DISPATCHED_TEXT = "Dispatched"
@@ -1191,7 +1192,13 @@ def build_sheet_update_requests(values):
 
         pod_date = pod["date"]
         display_date = pod_date.strftime("%d-%b-%Y")
-        display_datetime = pod_date.strftime("%d-%b-%Y %H:%M:%S")
+        # AP = Actual POD date. The POD source is a date (no time of day), so write
+        # date-only: "%H:%M:%S" gave a fake 00:00:00 (2026-11-11). A real time,
+        # if a source ever carries one, is kept.
+        if hasattr(pod_date, "time") and pod_date.time() != datetime.min.time():
+            ap_value = pod_date.strftime("%d-%b-%Y %H:%M:%S")
+        else:
+            ap_value = display_date
 
         # Google Sheets A1 notation for this row.
         aj_cell = f"AJ{row_num}"
@@ -1208,7 +1215,7 @@ def build_sheet_update_requests(values):
         if is_blank_value(current_ap):
             updates.append({
                 "range": f"'{SHEET_NAME}'!{ap_cell}",
-                "values": [[display_datetime]],
+                "values": [[ap_value]],
             })
 
         # AV = Delivered Date — only fill if blank.

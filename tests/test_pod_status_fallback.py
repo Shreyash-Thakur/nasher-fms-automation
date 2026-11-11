@@ -82,4 +82,5 @@ def test_status_and_delay_written_only_ao_aq_ar(st):
     assert ranges == ["'Full Flow FMS'!AO6465", "'Full Flow FMS'!AQ6465",
                       "'Full Flow FMS'!AR6465"]
     assert updates[0]["values"] == [["20-Aug-2026 07:00:00"]]
-    assert updates[2]["values"] == [["3d 17h 00m 00s"]]
+    # AP is date-only -> AR in calendar days (2026-11-11), not "3d 17h 00m 00s".
+    assert updates[2]["values"] == [["4d"]]

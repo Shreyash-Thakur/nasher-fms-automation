@@ -266,6 +266,11 @@ def format_time_delay(actual, planned):
     return f"{hours:02d}h {minutes:02d}m {seconds:02d}s"
 
 
+def format_day_delay(actual, planned):
+    """Calendar-day gap (no sign) for a date-only Actual, e.g. "4d" / "0d"."""
+    return f"{abs((actual.date() - planned.date()).days)}d"
+
+
 def process_stage(
     row_values,
     row,
@@ -347,10 +352,18 @@ def process_stage(
             status,
         )
     )
+    # AP (POD) is a date-only source: the POD step writes "dd-Mmm-yyyy" and the
+    # sheet shows it as 00:00:00. Measure it in whole calendar days so AR does
+    # not report a fake hours/minutes gap from midnight (2026-11-11).
+    if col_actual == COL_AP and actual_dt.time() == datetime.min.time():
+        delay_text = format_day_delay(actual_dt, planned_dt)
+    else:
+        delay_text = format_time_delay(actual_dt, planned_dt)
+
     updates.append(
         make_update(
             f"'{MAIN_SHEET}'!{delay_letter}{row}",
-            format_time_delay(actual_dt, planned_dt),
+            delay_text,
         )
     )
 
@@ -369,10 +382,12 @@ STAGE_OFFSETS_AFTER_X = (
     timedelta(minutes=30), timedelta(hours=6), timedelta(minutes=30), timedelta(hours=24))
 
 
-def stage6_planned(row_values, actual_AL, holidays):
+def stage6_planned(row_values, actual_AL, holidays, planned_AK=None):
     """Planned AO for the POD stage -> (datetime, basis) or (None, None).
 
     Normal: AO = AL + 24h (basis "AL").
+    2026-11-11: AL blank but AK planned (X known) -> AO = AK + 24h (basis "AK").
+    AL is no longer filled on plan, so the chain continues from Planned.
     2026-10-31 fallback: X (Pick Actual) blank, so the chain X -> AB -> AG -> AL never
     ran, but AP (POD date) is a date. Without AO, AQ/AR stayed blank on 198 rows that
     have a POD. The next known EARLIER date of the row stands in for X: S (punch date),
@@ -382,6 +397,8 @@ def stage6_planned(row_values, actual_AL, holidays):
     """
     if actual_AL is not None:
         return add_time_skip_holidays(actual_AL, timedelta(hours=24), holidays), "AL"
+    if planned_AK is not None:
+        return add_time_skip_holidays(planned_AK, timedelta(hours=24), holidays), "AK"
     if to_datetime(get_value(row_values, COL_X)) is not None:
         return None, None
     if to_datetime(get_value(row_values, COL_AP)) is None:
@@ -396,31 +413,25 @@ def stage6_planned(row_values, actual_AL, holidays):
     return None, None
 
 
-def resolve_stage_actual(row_values, col_actual, planned_dt, row, updates):
-    """Return the Actual datetime to use for an internal handoff stage.
+def resolve_stage_actual(row_values, col_actual):
+    """Return the RECORDED Actual datetime of an internal stage, or None.
 
-    Internal stages (courier assignment, label generation, pickup) do
-    not get their own logged timestamp. So:
-
-      - If the Actual cell already has a value, parse and return it.
-        A real recorded Actual is NEVER overwritten.
-      - If the Actual cell is blank, treat the stage as completed on
-        plan: return the Planned datetime AND queue writing it into the
-        blank Actual cell, so the sheet and the in-memory cascade agree
-        and the next stage's Planned can be computed in the same run.
+    2026-11-11: this is read-only. Courier (AB), label (AG) and dispatch (AL)
+    have no event source in this script, so a blank Actual STAYS blank.
+    Before, a blank Actual was filled with the Planned datetime ("completed on
+    plan"): 6,640 of 6,640 datetime Actuals in AB/AG/AL equalled Planned and
+    every AC/AH/AM status read "On Time" (fabricated). See
+    "Errors and their fixes/2026-11-11-fabricated-stage-actuals.md".
     """
-    existing = to_datetime(get_value(row_values, col_actual))
-    if existing is not None:
-        return existing
+    return to_datetime(get_value(row_values, col_actual))
 
-    letter = column_number_to_letter(col_actual)
-    updates.append(
-        make_update(
-            f"'{MAIN_SHEET}'!{letter}{row}",
-            planned_dt.strftime("%d-%b-%Y %H:%M:%S"),
-        )
-    )
-    return planned_dt
+
+def chain_basis(actual_dt, planned_dt):
+    """Anchor for the NEXT stage's Planned: the real Actual when one is
+    recorded, else this stage's Planned (so AF / AK / AO are still filled
+    when AB / AG / AL are blank)."""
+    return actual_dt if actual_dt is not None else planned_dt
+
 
 # ============================================================
 # === END RECONSTRUCTED HELPERS ==============================
@@ -913,6 +924,103 @@ def apply_updates(
     return len(updates)
 
 
+def internal_actual_writes(updates):
+    """Ranges in `updates` that target AB / AG / AL (should always be empty)."""
+    out = []
+    for update in updates:
+        cell = update["range"].rsplit("!", 1)[-1]
+        letters = cell.rstrip("0123456789")
+        if letters in ("AB", "AG", "AL"):
+            out.append(update["range"])
+    return out
+
+
+def process_row(row_values, row, holidays, updates, format_requests, sheet_id):
+    """Plan one Full Flow FMS row: Planned for every stage it can, Status +
+    Time Delay ONLY where a real Actual is recorded.
+
+    2026-11-11 (fabricated actuals fix):
+      - AB / AG / AL are never written. A blank Actual stays blank and its
+        Status (AC / AH / AM) + Time Delay (AD / AI / AN) stay blank too.
+      - The Planned chain continues from the previous PLANNED when the
+        previous Actual is blank, else from the real Actual:
+            AA = X + 30m, AF = (AB or AA) + 6h, AK = (AG or AF) + 30m,
+            AO = (AL or AK) + 24h.
+
+    Alerts: this script sends NO e-mail / chat alerts and its red cell
+    formatting is disabled (format_requests stays empty). The only "alert"
+    it produces is the Status text ("Delay"), and that is written only from
+    a real Actual. So a blank courier (AB) / label (AG) / dispatch (AL)
+    Actual can never raise an overdue alert.
+
+    Returns counters for main()'s summary.
+    """
+    out = {"R": 0, "W": 0, "AA": 0, "AF": 0, "AK": 0, "AO": 0,
+           "AO_basis": None, "stage1_status": ""}
+
+    # STAGE 1: R = A + 24h ; S = Actual
+    form_received = to_datetime(get_value(row_values, COL_FORM_RECEIVED))
+    if form_received is not None:
+        planned_R = add_time_skip_holidays(form_received, timedelta(hours=24), holidays)
+        out["stage1_status"] = process_stage(
+            row_values, row, COL_R, COL_S, COL_T, COL_U, planned_R,
+            updates, format_requests, sheet_id)
+        out["R"] = 1
+
+    # STAGE 2: W = S + 24h ; X = Actual (pick, from Vinculum Pick Pack)
+    actual_S = to_datetime(get_value(row_values, COL_S))
+    if actual_S is not None:
+        planned_W = add_time_skip_holidays(actual_S, timedelta(hours=24), holidays)
+        process_stage(
+            row_values, row, COL_W, COL_X, COL_Y, COL_Z, planned_W,
+            updates, format_requests, sheet_id)
+        out["W"] = 1
+
+    # STAGES 3-5: internal handoffs. Actual read-only (resolve_stage_actual).
+    actual_X = to_datetime(get_value(row_values, COL_X))
+    planned_AK = None
+    actual_AL = None
+
+    if actual_X is not None:
+        # STAGE 3: AA = X + 30m ; AB = courier Actual
+        planned_AA = add_time_skip_holidays(actual_X, timedelta(minutes=30), holidays)
+        actual_AB = resolve_stage_actual(row_values, COL_AB)
+        process_stage(
+            row_values, row, COL_AA, COL_AB, COL_AC, COL_AD, planned_AA,
+            updates, format_requests, sheet_id, actual_override=actual_AB)
+        out["AA"] = 1
+
+        # STAGE 4: AF = (AB or AA) + 6h ; AG = label Actual
+        planned_AF = add_time_skip_holidays(
+            chain_basis(actual_AB, planned_AA), timedelta(hours=6), holidays)
+        actual_AG = resolve_stage_actual(row_values, COL_AG)
+        process_stage(
+            row_values, row, COL_AF, COL_AG, COL_AH, COL_AI, planned_AF,
+            updates, format_requests, sheet_id, actual_override=actual_AG)
+        out["AF"] = 1
+
+        # STAGE 5: AK = (AG or AF) + 30m ; AL = dispatch Actual
+        planned_AK = add_time_skip_holidays(
+            chain_basis(actual_AG, planned_AF), timedelta(minutes=30), holidays)
+        actual_AL = resolve_stage_actual(row_values, COL_AL)
+        process_stage(
+            row_values, row, COL_AK, COL_AL, COL_AM, COL_AN, planned_AK,
+            updates, format_requests, sheet_id, actual_override=actual_AL)
+        out["AK"] = 1
+
+    # STAGE 6: AO = (AL or AK) + 24h ; AP = POD date (real, from the POD step).
+    # X blank + POD date present: AO from S (else A), see stage6_planned.
+    planned_AO, ao_basis = stage6_planned(row_values, actual_AL, holidays, planned_AK)
+    if planned_AO is not None:
+        process_stage(
+            row_values, row, COL_AO, COL_AP, COL_AQ, COL_AR, planned_AO,
+            updates, format_requests, sheet_id)
+        out["AO"] = 1
+        out["AO_basis"] = ao_basis
+
+    return out
+
+
 def main():
 
     print()
@@ -1013,242 +1121,33 @@ def main():
         row = DATA_START_ROW + offset
         rows_processed += 1
 
-        # ====================================================
-        # STAGE 1
-        # R = A + 24 hours
-        # S = Actual
-        # T = Status
-        # U = Time Delay
-        # ====================================================
+        result = process_row(
+            row_values, row, holidays, updates, format_requests, main_sheet_id)
 
-        form_received = to_datetime(
-            get_value(
-                row_values,
-                COL_FORM_RECEIVED,
-            )
-        )
-
-        if form_received is not None:
-
-            planned_R = add_time_skip_holidays(
-                form_received,
-                timedelta(hours=24),
-                holidays,
-            )
-
-            status = process_stage(
-                row_values,
-                row,
-                COL_R,
-                COL_S,
-                COL_T,
-                COL_U,
-                planned_R,
-                updates,
-                format_requests,
-                main_sheet_id,
-            )
-
-            stage1_planned += 1
-
-            if status in status_counts:
-                status_counts[status] += 1
-
-        # ====================================================
-        # STAGE 2
-        # W = S + 24 hours
-        # ====================================================
-
-        actual_S = to_datetime(
-            get_value(
-                row_values,
-                COL_S,
-            )
-        )
-
-        if actual_S is not None:
-
-            planned_W = add_time_skip_holidays(
-                actual_S,
-                timedelta(hours=24),
-                holidays,
-            )
-
-            status = process_stage(
-                row_values,
-                row,
-                COL_W,
-                COL_X,
-                COL_Y,
-                COL_Z,
-                planned_W,
-                updates,
-                format_requests,
-                main_sheet_id,
-            )
-
-            stage2_planned += 1
-
-        # ====================================================
-        # STAGE 3  (AA = X + 30 min ; AB = Actual)
-        #
-        # Internal handoff. If AB is blank we treat it as completed on
-        # plan (AB = AA) and write it into the Actual cell. The value is
-        # also carried forward in memory so Stage 4's Planned can be
-        # computed in the same run. A real AB value is never overwritten.
-        # ====================================================
-
-        actual_X = to_datetime(
-            get_value(
-                row_values,
-                COL_X,
-            )
-        )
-
-        actual_AB = None
-
-        if actual_X is not None:
-
-            planned_AA = add_time_skip_holidays(
-                actual_X,
-                timedelta(minutes=30),
-                holidays,
-            )
-
-            actual_AB = resolve_stage_actual(
-                row_values,
-                COL_AB,
-                planned_AA,
-                row,
-                updates,
-            )
-
-            process_stage(
-                row_values,
-                row,
-                COL_AA,
-                COL_AB,
-                COL_AC,
-                COL_AD,
-                planned_AA,
-                updates,
-                format_requests,
-                main_sheet_id,
-                actual_override=actual_AB,
-            )
-
-            stage3_planned += 1
-
-        # ====================================================
-        # STAGE 4  (AF = AB + 6 hours ; AG = Actual)
-        # ====================================================
-
-        actual_AG = None
-
-        if actual_AB is not None:
-
-            planned_AF = add_time_skip_holidays(
-                actual_AB,
-                timedelta(hours=6),
-                holidays,
-            )
-
-            actual_AG = resolve_stage_actual(
-                row_values,
-                COL_AG,
-                planned_AF,
-                row,
-                updates,
-            )
-
-            process_stage(
-                row_values,
-                row,
-                COL_AF,
-                COL_AG,
-                COL_AH,
-                COL_AI,
-                planned_AF,
-                updates,
-                format_requests,
-                main_sheet_id,
-                actual_override=actual_AG,
-            )
-
-            stage4_planned += 1
-
-        # ====================================================
-        # STAGE 5  (AK = AG + 30 min ; AL = Actual)
-        # ====================================================
-
-        actual_AL = None
-
-        if actual_AG is not None:
-
-            planned_AK = add_time_skip_holidays(
-                actual_AG,
-                timedelta(minutes=30),
-                holidays,
-            )
-
-            actual_AL = resolve_stage_actual(
-                row_values,
-                COL_AL,
-                planned_AK,
-                row,
-                updates,
-            )
-
-            process_stage(
-                row_values,
-                row,
-                COL_AK,
-                COL_AL,
-                COL_AM,
-                COL_AN,
-                planned_AK,
-                updates,
-                format_requests,
-                main_sheet_id,
-                actual_override=actual_AL,
-            )
-
-            stage5_planned += 1
-
-        # ====================================================
-        # STAGE 6  (AO = AL + 24 hours ; AP = Actual)
-        #
-        # Final stage. AP is a REAL external actual (delivery / POD) and
-        # is NOT auto-filled. Status/Time Delay (AQ/AR) are computed only
-        # when AP already has a value.
-        # X blank + POD date present: AO from S (else A), see stage6_planned.
-        # ====================================================
-
-        planned_AO, ao_basis = stage6_planned(row_values, actual_AL, holidays)
-
-        if planned_AO is not None:
-
-            process_stage(
-                row_values,
-                row,
-                COL_AO,
-                COL_AP,
-                COL_AQ,
-                COL_AR,
-                planned_AO,
-                updates,
-                format_requests,
-                main_sheet_id,
-            )
-
-            stage6_planned_count += 1
-            if ao_basis != "AL":
-                stage6_fallback_count += 1
+        stage1_planned += result["R"]
+        stage2_planned += result["W"]
+        stage3_planned += result["AA"]
+        stage4_planned += result["AF"]
+        stage5_planned += result["AK"]
+        stage6_planned_count += result["AO"]
+        if result["AO"] and result["AO_basis"] not in ("AL", "AK"):
+            stage6_fallback_count += 1
+        if result["stage1_status"] in status_counts:
+            status_counts[result["stage1_status"]] += 1
 
         if rows_processed % 500 == 0:
             print(
                 f"Processed {rows_processed:,} rows..."
             )
+
+    # Guard (2026-11-11): this script must never write an internal-stage
+    # Actual. Abort before writing anything if one slipped into the batch.
+    actual_writes = internal_actual_writes(updates)
+    print(f"AB/AG/AL Actual cells queued: {len(actual_writes)} (must be 0)")
+    if actual_writes:
+        raise RuntimeError(
+            f"Refusing to write {len(actual_writes)} AB/AG/AL Actual cells, "
+            f"e.g. {actual_writes[:3]}")
 
     # ========================================================
     # WRITE TO GOOGLE SHEET

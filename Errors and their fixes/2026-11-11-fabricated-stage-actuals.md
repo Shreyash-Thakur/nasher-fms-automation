@@ -1,0 +1,58 @@
+# GT Full Flow courier / label / dispatch Actuals were fabricated (Actual = Planned)
+
+- **Date:** 2026-11-11
+- **Reported as:** the boss's brief finding "05. GT stage Actual timestamps equal Planned".
+- **Symptom:**
+  - In GT Full Flow FMS (`1jMEEFkAVfg7NHtxj3QCYuNY_V-AhU00ljQeRYTBQDio`, tab "Full Flow FMS"), all 6,640 of 6,640 datetime Actuals in AB (courier), AG (label) and AL (dispatch) equal their Planned (AA / AF / AK) exactly, to the second.
+  - So AC / AH / AM read "On Time" everywhere and AD / AI / AN read `00h 00m 00s`. Every on-time and delay metric for these stages was made up.
+  - Real evidence disagrees with the sheet. M892834 has AL 05-Nov 18:02, but the dispatch e-mail says 07-Nov. N012299 has AL 05-Nov, but it was really dispatched 06-Nov.
+- **Where:** `scripts/gt_full_flow_fms_planned_status_google_sheet_alerts_quota_fixed_v3.py`, `resolve_stage_actual()`, called for AB, AG and AL in the per-row loop of `main()`.
+- **Root cause:**
+  - These three stages have no event source in this job, because nothing logs courier assignment, label generation or dispatch.
+  - `resolve_stage_actual()` filled the gap by design: if the Actual was blank, it "treated the stage as completed on plan". It returned the Planned datetime **and queued writing it into the Actual cell**.
+  - `process_stage(..., actual_override=...)` then computed Status and Delay from that fake Actual, so it always wrote "On Time" with a zero delay.
+  - The next Planned (AF, AK, AO) was chained off the fake Actual.
+  - The function sat in a block headed "RECONSTRUCTED HELPERS - VERIFY AGAINST YOUR ORIGINALS". It was a best guess and was never verified.
+- **Why it wasn't caught:**
+  - The values look like real timestamps, and the dashboards count filled cells and "On Time".
+  - No test asserted that a blank Actual stays blank.
+  - The POD script noted on 2026-11-01 that "AB / AG / AL 'Actual' are NOT evidence", but the writer itself was not changed.
+- **Fix (nasher-fms-automation, branch `fix/no-fabricated-actuals`, merged to `main`):**
+  - `resolve_stage_actual(row_values, col_actual)` is now read-only. It returns the recorded Actual or None, and never queues an update.
+  - A blank AB / AG / AL stays blank. Its Status (AC / AH / AM) and Time Delay (AD / AI / AN) are written only from a real Actual and otherwise stay blank. Blank was chosen over "Not tracked" because GT_FMS `dashboard.js` already treats a blank status as "no status" (rank 0). A text value would look like a value to fill-rate counts.
+  - The Planned chain still fills AF, AK and AO. It starts from the previous **Planned** when the previous Actual is blank, and from the real Actual when one exists (`chain_basis`). `stage6_planned(..., planned_AK)` gives AO = AK + 24h (basis "AK") when AL is blank. The 2026-10-31 S/A fallback for a blank X is unchanged.
+  - The per-row logic moved into `process_row()` so it can be tested.
+  - Guard: `internal_actual_writes(updates)` runs before any write. The job aborts if any AB / AG / AL cell is queued, and logs `AB/AG/AL Actual cells queued: 0 (must be 0)`.
+  - **Alerts.** This script sends no e-mail or chat alerts, and its red-cell formatting has been disabled since earlier (`format_requests` stays empty). The only "alert" it produces is the Status text "Delay", and that now comes only from a real Actual. Therefore:
+    - courier (AB) and label (AG) can never alert;
+    - a blank dispatch (AL) does not alert either.
+    - No new overdue alert was added. Under the agreed rule, a dispatch alert would be allowed only when AL is blank **and** there is no AWB in AE **and** no AS. That rule is recorded here for whoever adds a dispatch alert later. The least noisy correct behaviour today is no alert at all.
+  - AP (POD) is now written date-only (`%d-%b-%Y`) by `gt_full_flow_fms_pod_update_google_sheet_gt_and_order_only.py`. Before, it used `%H:%M:%S` on a date-only source, which gave a fake 00:00:00. A real time of day would still be kept.
+  - AR (POD delay) is now measured in whole calendar days (`format_day_delay`, for example "4d") when AP has no time of day. Before, it read like "3d 17h 00m 00s", measured from a fake midnight.
+  - New `scripts/audit_fabricated_actuals.py`. It is **DRY RUN by default**:
+    - It finds every row where AB==AA, AG==AF or AL==AK (an exact, non-blank match) and writes `reports/fabricated_actuals_audit.csv`.
+    - `--apply-audit-tab` also writes a NEW tab "Fabricated Actuals Audit".
+    - `--apply` first copies every cell it will clear to a NEW tab "Fabricated Actuals Backup <stamp>". It then blanks the fingerprint Actual and its Status and Delay cells. Planned cells are never touched.
+  - The same fix (planned-status script, AP date-only, and the tests) was committed **locally only** in `Sales Reports/nasher-miles-report-automation`, branch `gt-fms-full-flow` (`gt_fms/`). That branch is not pushed.
+- **Evidence:**
+  - Sheet counts: 6,640 of 6,640 datetime AB / AG / AL Actuals equal Planned exactly. Real dispatch dates for M892834 (07-Nov) and N012299 (06-Nov) differ from AL (05-Nov).
+  - New tests:
+    - `tests/test_no_fabricated_actuals.py` (12): a blank Actual is never written; the Planned chain continues from Planned, from a real Actual, and over holidays; no status, delay or format for a blank AB / AG / AL; a real late AL gives "Delay" with `2d 16h 00m 00s`; same-day gives On Time and earlier gives Early; the write guard; AR in days; AP written as `10-Sep-2026`.
+    - `tests/test_audit_fabricated_actuals.py` (3): the fingerprint is found per stage; the dry run makes no Sheets write calls; `--apply` makes the backup tab before clearing.
+  - One existing assertion changed on purpose. In `test_pod_status_fallback.py`, AR for AP `24-Aug-2026 00:00:00` is now `4d`; it was `3d 17h 00m 00s`.
+  - Full suite (nasher-fms-automation): `241 passed in 1.24s` (226 before, plus 15 new).
+  - Full suite (nasher-miles-report-automation `gt_fms/`): `172 passed in 1.03s`.
+- **Blast radius:**
+  - Only the AA–AR stage block of Full Flow FMS.
+  - From the next run, new rows get AA / AF / AK / AO Planned only. AB / AG / AL and their status and delay stay blank until a real event writes AB / AG / AL.
+  - Existing fabricated cells are **not** cleared by the job. They still read "On Time" until the audit repair is approved and run.
+  - AO values do not change for existing rows, because the fake AL equalled AK. AO is still AK + 24h.
+  - New AR values on date-only AP read "Nd". Existing AR cells are not rewritten.
+  - GT_FMS `dashboard.js` Section C treats a blank AB / AG as "Courier" / "Label" missing. That dashboard is being changed by another agent to base dispatch on AE AWB / AS.
+- **Still open:**
+  - **Historic repair is awaiting owner approval.** Run `python scripts/audit_fabricated_actuals.py` for the dry-run CSV, then `--apply` only after approval.
+  - A real AL from the Vinculum shipdate is being added by the punch portal (another agent). Once it lands, AM / AN become real for new dispatches.
+  - Courier (AB) and label (AG) still have no event source, so they stay blank.
+- **Related:**
+  - `Errors and their fixes/2026-10-31-pod-status-blank-when-pick-date-blank.md` (the S/A fallback for AO).
+  - `Errors and their fixes/2026-11-01-gt-order-status-blank-until-pod.md` (AJ uses AE / AW, not AB / AG / AL).
