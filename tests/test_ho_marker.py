@@ -28,8 +28,11 @@ def test_ho_row_never_written_by_backfill(make):
 
 
 def test_pod_never_turns_ho_into_delivered(pod, monkeypatch):
-    monkeypatch.setattr(pod, "exact_index", {"GT1|N461001": {"date": datetime(2026, 9, 10), "url": "https://drive/x"}})
-    row = [""] * 48
+    # 699c1c4: the POD index is keyed by Order No alone (pod_index), not "GT|ORDER".
+    rec = {"gt": "GT1", "order": "N461001", "date": datetime(2026, 9, 10), "url": "https://drive/x",
+           "filename": "GT1 | POD | N461001 | 10-09-2026 | x.pdf"}
+    monkeypatch.setattr(pod, "pod_index", {pod.normalize_order("N461001"): [rec]})
+    row = [""] * 49
     row[pod.COL_GT - 1] = "GT1"
     row[pod.COL_ORDER - 1] = "N461001"
     row[pod.COL_AJ - 1] = "Head Office (HO)"
