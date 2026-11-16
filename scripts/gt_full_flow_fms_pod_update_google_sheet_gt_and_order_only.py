@@ -1015,7 +1015,8 @@ def is_blank_value(value):
 # on the invoice's lines (user: "Kindly provide an option to mark the invoice status as
 # "RTV" (Return to Vendor) in the POD Update Sheet."). Without it a matched POD
 # overwrote AJ "RTV" with "Delivered" and filled AP / AU / AV.
-CLOSED_MARKERS = {"cancelled", "virtual invoice", "out of stock", "oos", "rtv"}
+# 16-Nov-2026: + "head office (ho)" (GeneralTrade_FMS GtHoMark.js marks Head Office lines in AJ; a POD never turns them back).
+CLOSED_MARKERS = {"cancelled", "virtual invoice", "out of stock", "oos", "rtv", "head office (ho)"}
 CLOSED_MARKER_COLUMNS = [COL_GT] + list(range(COL_ORDER, COL_AW + 1))   # C, P:AW
 
 
