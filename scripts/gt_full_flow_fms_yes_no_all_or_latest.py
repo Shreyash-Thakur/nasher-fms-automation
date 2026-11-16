@@ -1099,6 +1099,29 @@ def create_match_key(order_no, sku):
     return normalize_value(order_no) + "||" + normalize_value(sku)
 
 
+# 16-Nov-2026: the Vinculum API key owner ("Diwakar", the account the punch portal creates orders with) and the
+# automation mailbox are accounts, not people. Every portal-punched order shows "Created by" = Diwakar, so copying
+# it into Team (Q) put the API account on ops' dashboards. Q is left blank for those; the punch portal writes the real
+# punching user at punch time (punch_run.js pnGtWriteTeam_) and GT_FMS GtTeamAuto.js / GtTeamFix.js fill the rest.
+# Record: Errors and their fixes/2026-11-16-ops-team-shows-api-account.md
+API_ACCOUNT_NAMES = {"diwakar", "finance.automation", "finance.automation@nashermiles.com"}
+
+
+def team_from_creator(created_by):
+    """Vinculum "Created by" -> the value for Team (Q): None when blank or an API account (not a person)."""
+    if created_by is None:
+        return None
+    try:
+        if pd.isna(created_by):
+            return None
+    except Exception:
+        pass
+    txt = str(created_by).replace(" ", " ").strip()
+    if not txt or " ".join(txt.lower().split()) in API_ACCOUNT_NAMES:
+        return None
+    return created_by
+
+
 def value_found(value):
     if value is None:
         return False
@@ -1885,7 +1908,7 @@ class OrderEnquiryIndex:
                 continue
             self.records[order] = {
                 "order_no": r["Order No"], "order_date": r["Order Date"],
-                "team": r["Created by"] if has_team else None, "status": r["Status"],
+                "team": team_from_creator(r["Created by"]) if has_team else None, "status": r["Status"],
                 "ext_order_no": r["ExtOrderNo"]}
             self._add(r["_GT"], r["_GT_BASE"], order)
         self.invoiced = set(sales_lines["_ORDER"]) - {""}
@@ -2193,8 +2216,9 @@ def build_full_flow(fms_df, assigned, pick_pack_lookup, warehouse_mapping, oe_re
 
                 # Order Enquiry -> Full Flow mappings
                 output_row["Order No"] = sales_row["Order No"]        # P
-                if fill_value_ok("Team", sales_row["Created by"]):    # Q (never the API user)
-                    output_row["Team"] = sales_row["Created by"]
+                _team = team_from_creator(sales_row["Created by"])   # Q (never the API account)
+                if _team and fill_value_ok("Team", _team):
+                    output_row["Team"] = _team
                 output_row["Actual"] = sales_row["Order Date"]        # S
                 output_row["Invoice No"] = sales_row["Invoice No"]    # AW
                 output_row["Invoice Amount"] = sales_row["Total"]     # AY
@@ -2320,7 +2344,9 @@ NEW_LINES_FOR_EXISTING_GTS_MAX = 300
 # Values that mark a line as closed by a human / earlier job. Such rows are never written.
 # 2026-11-16: "rtv" (Return to Vendor) — AJ "RTV" from the GT_FMS POD dashboard RTV button
 # closes the line like "Cancelled" (no refresh / fill of a returned invoice's line).
-CLOSED_MARKERS = {"cancelled", "virtual invoice", "out of stock", "oos", "rtv"}
+# 16-Nov-2026: + "head office (ho)" - Head Office (H01) lines are marked in AJ by GeneralTrade_FMS GtHoMark.js and hidden from the
+# dashboards; the nightly job leaves such a line exactly as marked (never fills / overwrites it).
+CLOSED_MARKERS = {"cancelled", "virtual invoice", "out of stock", "oos", "rtv", "head office (ho)"}
 
 # Output columns in which a closed marker is looked for: J (Order Quantity) and P:AW.
 _P_INDEX = OUTPUT_COLUMNS.index("Order No")
@@ -2342,7 +2368,7 @@ def _dispatched_qty(sale):
 # Output column <- how to get the value from a matched Order Enquiry row.
 BACKFILL_FIELDS = [
     ("Order No", lambda s, wh: s["Order No"]),                    # P
-    ("Team", lambda s, wh: s["Created by"]),                      # Q
+    ("Team", lambda s, wh: team_from_creator(s["Created by"])),     # Q (never the API account)
     ("Actual", lambda s, wh: s["Order Date"]),                    # S
     ("Invoice No", lambda s, wh: s["Invoice No"]),                # AW
     ("Invoice Amount", lambda s, wh: s["Total"]),                 # AY
