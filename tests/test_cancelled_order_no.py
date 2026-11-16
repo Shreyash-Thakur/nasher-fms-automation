@@ -111,7 +111,7 @@ def test_sentinel_not_a_candidate_order_for_siblings(ff, make):
     writes, stats = make.plan(
         [{"GT Number": "GT1", "Vinculum SKU": "A", "Order No": "Cancelled", "Status": "Cancelled"},
          {"GT Number": "GT1", "Vinculum SKU": "B"}],
-        [], oe_rows=[{"Order No": "N7", "ExtOrderNo": "GT1"}])
+        [], oe_rows=[{"Order No": "N7", "ExtOrderNo": "GT1"}], pick_pack_skus={"N7": {"B"}})
     c = make.cells(writes)
     assert c[(9, "Order No")] == "N7"
     assert stats["oe_outcomes"]["ambiguous"] == 0

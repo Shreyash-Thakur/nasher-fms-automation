@@ -1,0 +1,66 @@
+# GT Full Flow P (Order No) stamped per GT, not per SKU: SKU-proof guard + nightly Vinculum cross-check
+
+- **Date:** 2026-11-16
+- **Reported as:**
+  - User: "also check order mappings with gt and kasa numbers thorugly".
+  - Follow-up, same day: "can you not fix the quantiyt and order id overlapp all such issues at once it just requires cross check with viniculum … make sure this doesn't happen in future".
+- **Symptom:**
+  - GT141026A1, sheet rows 8420-8491: col P = O94134 on all 72 rows. O94134 holds only NMH8113CL / NMH8113CM. 40 rows were invoiced on the GT's other orders: M892791, N89724, N012273 and N051641. Col AW already showed the right invoice, so P and AW disagreed.
+  - GT151026A4 (rows 8525-8527) and GT151026A5 (rows 8531-8533) had the same fault (M892794 / M892795 instead of N012275 / N012276).
+  - Since b3786e3 the POD sync matches by Order No, so a wrong P also sends PODs to the wrong rows.
+  - Those 46 cells were corrected by hand in the sheet on 16-Nov 13:58 (backup tab "Order No Fix Backup 2026-11-16 1358"). This record covers the cause and the guard in the nightly job.
+- **Where:**
+  - `scripts/gt_full_flow_fms_yes_no_all_or_latest.py`.
+  - `OrderEnquiryIndex.match` (was lines 1893-1911 at 699c1c4). It is called from `plan_existing_writes` (existing rows, was line 2755) and from `main()` (rows being appended, was line 3302). `_oe_cells` / `build_full_flow` then wrote the order into P and S.
+  - Sheet: GT workbook, tab "Full Flow FMS", header row 7. Columns: C GT Number, D Vinculum SKU, E SKU Code, J Order Quantity, P Order No, AS Dispatched Qty, AW Invoice No.
+- **Root cause:**
+  - The daily Order Enquiry export is order-level: it has no SKU column.
+  - `match(gt, base)` took the GT alone. When the GT had exactly one live, not-invoiced order, it returned that order, and every blank-P row of the GT got it.
+  - Vinculum splits a GT into one order per warehouse, and GTs are punched in parts. While only the first part existed, a run saw one candidate and put the first part's order on rows that belong to later parts.
+  - Later runs never wrote P again, because P is blanks-only. The 31-Oct fix (`2026-10-31-invoiced-rows-never-filled-wrong-order-in-p.md`) then filled AW etc. from the right order's line but left P wrong.
+  - The 10-Oct record already named the risk ("A GT punched as one order and split again on a later day would have got the first order on all its rows").
+- **Why it wasn't caught:**
+  - The tests (`tests/test_order_enquiry.py`) asserted the GT-wide fill as the intended behaviour ("one order, every line of the GT").
+  - Nothing compared P with the order of the invoice in AW. `order_no_mismatch.csv` listed such rows, but only as a CSV artifact nobody read.
+  - Run history: the scan of the last 40 GT FMS Automation runs (31-Oct to 15-Nov) found Order Enquiry fills in only one run: 41334946031 (1-Nov 18:07Z, 71 rows). The 15 rows that run printed are all GT311026A1R -> N89739 (Allocated). N89739 has no Sales Master line yet, so whether those 71 rows are right cannot be told offline. The GT141026A1 stamping happened before the logs that were checked.
+- **Fix:**
+  - **1. GT-only fill guard (cause).** `OrderEnquiryIndex.match(gt, base, skus)` returns an order only when line-level data puts one of the row's SKUs (Vinculum SKU or SKU Code) on that order. Line-level data means Pick Pack (Order No + SKU Code, via the new `build_pick_pack_sku_index`) or Sales Master lines.
+    - With no proof, the outcome is `no_sku_proof`: P stays blank and the log prints `order-enquiry GT-only match skipped (no SKU proof): row N GT X order Y` (`report_oe_no_sku_proof`). The same rule applies to rows being appended (`match_slot_oe`).
+    - In `unmatched_rows.csv` these rows get the new reason `punched_not_invoiced_no_sku_proof`.
+    - Sales Master (line-level) fills are unchanged.
+  - **2. Suspected wrong P (report only).** `report_order_no_without_sku_proof` lists rows in `reports/order_no_suspect_no_sku.csv`. A row is listed when P is filled, every order in P is known line by line, and none of those orders carries the row's SKU. The column `orders_with_sku` names the sibling order that does. The job never rewrites these rows.
+  - **3. (a) Invoice-proven P correction.** `plan_invoice_order_fixes` handles open rows whose AW invoice is, in the Sales Master, a line of this GT + SKU on one order X that P does not contain. P becomes X only when every order in P is known line by line and none of them carries the SKU. This is the one allowed overwrite of a filled P.
+    - Every change is printed as `invoice-proven P fix: row N GT X / SKU P old -> new (invoice …)` and listed in `reports/order_no_invoice_fixes.csv`.
+    - Each of the following is held (report only): `invoice_of_other_gt`, `invoice_has_no_line_for_sku`, `invoice_spans_orders`, `p_order_lines_unknown`, `p_order_also_carries_sku` (a split line) and `over_cap` (more than `INVOICE_ORDER_NO_FIX_MAX` = 200 fixes in one night, in which case none is written).
+  - **4. (b) Quantity cross-check.** `plan_qty_crosscheck` writes `reports/qty_crosscheck.csv` with these checks:
+    - `dispatched_mismatch`: the sum of AS of the rows of (P order, GT, SKU) differs from the sum of Vinculum Pick Qty.
+    - `order_qty_mismatch`: J differs from Vinculum Orderqty over the GT's orders. This is skipped when Sales has no Orderqty value; Oct-26 has none.
+    - `qty_overlap`: the same order + SKU appears on rows of two GTs.
+    - `dispatched_fixed`: AS is set to Pick Qty only when there is one row, one Vinculum line, and the row's AW is that line's invoice. This is the second allowed overwrite.
+  - **5. (c) Duplicate-order detector.** `report_duplicate_order_nos` writes `reports/duplicate_order_nos.csv` and logs the count. It lists an Order No found on rows of two unrelated GTs. The R/T/F repunch family of one GT shares a base and is not flagged.
+  - Everything else stays blanks-only. All CSVs go to the existing `fullflow-reports` workflow artifact. In dry-run mode nothing is written; the fixes are only printed.
+- **Evidence:**
+  - Tests: new `tests/test_oe_sku_proof.py` (12) and `tests/test_invoice_reconcile.py` (15).
+    - They cover: a GT punched in two parts (the first run fills only the SKUs proven on the first order, and the second run does not stamp the old order); no Pick Pack at all (nothing filled); a SKU-proven fill; a single-order GT with all SKUs proven; the append path; the suspect report; P fixed / held / capped / stable on the next run; AS fixed vs reported; J mismatch; overlap; duplicate orders.
+    - Ten old tests that asserted the GT-only fill now pass `pick_pack_skus`. Their intent is unchanged.
+    - `python -m pytest tests -q` -> `300 passed in 1.84s` (was 273 before this change).
+  - Offline replay, read-only, of the planners on the 16-Nov 12:13 Full Flow snapshot (before the hand correction) with the cached Sales Master and no Pick Pack data:
+    - `Order No (P) corrected from the row's own invoice (AW): 46; held for a human (report only): 0`. These are exactly the 46 rows corrected by hand at 13:58 (GT141026A1 x40, GT151026A4 x3, GT151026A5 x3).
+    - `Quantity cross-check vs Vinculum: AS fixed 0 | AS mismatch (report only) 20 | J vs Orderqty 0 | order+SKU on two GTs 0`. 10 of the 20 are GT070726A7 rows 5251-5269 (two Full Flow rows per SKU on N051547, AS 3 + 3 vs Pick Qty 3); GT240826A3 has 4, and 6 other GTs have 1 each.
+    - `Order Nos on rows of two unrelated GTs: 0`.
+    - `Rows whose Order No (P) does not carry their SKU … (suspected wrong P, NOT changed): 57`. These are mainly GT141026A1 / GT121026A1 lines that were never shipped, the SKU_NOT_IN_ORDER cases held on 16-Nov.
+  - Latest run, 43774791580 (15-Nov 23:26Z): `filled from Order Enquiry (punched orders): 0`, and nothing was appended. So the guard would have skipped 0 rows in that run.
+- **Blast radius:**
+  - P is now filled from Order Enquiry only for SKUs that have been picked (Pick Pack) or invoiced. A punched-but-not-picked GT keeps P blank until then, unless the punch portal wrote it, which it does for portal punches.
+  - After the 13:58 hand correction, the first run should make about 0 invoice-proven P fixes. Any non-zero count is a new case and is logged row by row.
+  - AS can now change on a filled cell, but only under the one-row / one-line / own-invoice rule.
+- **Still open:**
+  - The real Pick Pack SKU header is assumed to be "SKU Code" (as in the test fixtures; "Sku Code", "SKU", "Item Code" etc. also accepted). Check `Pick Pack orders with SKU lines (SKU proof for Order Enquiry): N` in the next run log. If it shows 0 together with the "Pick Pack has no SKU column" warning, Order Enquiry fills nothing, which is safe but the guard must then be pointed at the real header.
+  - The 57 suspect-P rows and the 20 quantity mismatches need a human; the job only reports them.
+  - The 71 rows stamped on 1-Nov (GT311026A1R -> N89739 in the visible samples) have no line-level evidence yet. They will appear in `order_no_suspect_no_sku.csv` or `order_no_invoice_fixes.csv` once N89739 or the GT's other orders are picked or invoiced.
+  - SKU-proven fills for GTs with more than one live un-invoiced order are not done. Those rows stay `ambiguous`; this could be added later, since the Pick Pack SKU index makes it possible.
+- **Related:**
+  - `2026-10-10-order-no-blank-until-invoiced.md` (introduced the Order Enquiry fill).
+  - `2026-10-31-invoiced-rows-never-filled-wrong-order-in-p.md` (other-order refresh, `order_no_mismatch.csv`).
+  - `2026-11-16-pod-mapped-by-order-and-rtv.md` (PODs matched by P).
+  - GT_FMS record `2026-11-16-gt-order-no-bulk-correction.md` (the 46-row hand correction, `GtOrderNoFix.js`).

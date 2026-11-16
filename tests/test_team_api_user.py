@@ -66,6 +66,7 @@ def test_api_user_q_not_blanked_or_rewritten(make):
 
 def test_oe_fill_skips_api_user(make):
     writes, _ = make.plan([{"GT Number": "GT1", "Vinculum SKU": "S"}], [],
+                          pick_pack_skus={"N1": {"S"}},
                           oe_rows=[{"Order No": "N1", "ExtOrderNo": "GT1", "Created by": "DIWAKAR"}])
     c = make.cells(writes)
     assert c[(8, "Order No")] == "N1" and (8, "Team") not in c

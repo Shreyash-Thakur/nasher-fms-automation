@@ -1851,11 +1851,26 @@ class OrderEnquiryIndex:
       2. Exactly ONE candidate, present in Order Enquiry and NOT invoiced (no Sales Master
          line) -> fill. An invoiced order belongs to the Sales Master, which is line-level:
          if it did not match this SKU, Order Enquiry cannot overrule that.
-      3. Otherwise no fill; the outcome is recorded for the log / unmatched report.
+      3. SKU proof (2026-11-16): the row's SKU (Vinculum SKU or SKU Code) must be on that
+         order in LINE-level data (order_skus: Pick Pack Order No + SKU Code, Sales lines).
+         Without it -> no fill, outcome "no_sku_proof". Before, a GT punched in parts got
+         its first part's order on every row (GT141026A1: O94134 on 72 rows, 40 wrong).
+      4. Otherwise no fill; the outcome is recorded for the log / unmatched report.
+    Record: "Errors and their fixes/2026-11-16-gt-only-order-fill-guard.md".
     """
 
-    def __init__(self, oe_orders, sales_lines, existing_df=None):
+    def __init__(self, oe_orders, sales_lines, existing_df=None, order_skus=None):
         oe_orders = oe_orders if oe_orders is not None else prepare_oe_orders(None)
+        self.order_skus = {}
+        for order, skus in (order_skus or {}).items():
+            key = normalize_value(order)
+            if key:
+                self.order_skus.setdefault(key, set()).update(
+                    v for v in map(normalize_value, skus) if v)
+        for order, sku, alt in zip(sales_lines["_ORDER"], sales_lines["_SKU"],
+                                   sales_lines["_SKU_ALT"]):
+            if order:
+                self.order_skus.setdefault(order, set()).update(v for v in (sku, alt) if v)
         self.records, self.cancelled = {}, set()
         self.by_gt, self.by_base, self.oe_by_base, self.cancelled_by_base = {}, {}, {}, {}
         has_team = "Created by" in oe_orders.columns
@@ -1890,8 +1905,22 @@ class OrderEnquiryIndex:
         if base:
             self.by_base.setdefault(base, set()).add(order)
 
-    def match(self, gt, base):
-        """-> (order key or None, outcome)."""
+    def match(self, gt, base, skus=()):
+        """-> (order key or None, outcome). skus = the row's SKU values; the order is
+        returned only when one of them is on it (order_skus). GT alone never fills."""
+        order, outcome = self._resolve(gt, base)
+        if order is None:
+            return None, outcome
+        row_skus = {v for v in map(normalize_value, skus or ()) if v}
+        if not row_skus & self.order_skus.get(order, set()):
+            return None, "no_sku_proof"
+        return order, outcome
+
+    def gt_only_order(self, gt, base):
+        """The order the GT-only rule (1-2) points at, without SKU proof - for reports."""
+        return self._resolve(gt, base)[0]
+
+    def _resolve(self, gt, base):
         if not base:
             return None, "no_gt"
         candidates = self.by_gt.get(gt, set()) - self.cancelled
@@ -2092,6 +2121,31 @@ def build_pick_pack_lookup(pick_pack_df):
             "Pick User": selected_pick_user,
         }
     return pick_pack_lookup
+
+
+# Pick Pack is LINE-level (Order No + SKU Code), unlike the daily Order Enquiry. Its
+# SKUs are the proof an Order Enquiry order needs before it may fill P (2026-11-16,
+# OrderEnquiryIndex). Header spellings tolerated, compared without case / spaces / "_".
+PICK_PACK_SKU_HEADERS = ("skucode", "sku", "itemcode", "itemsku", "skuno")
+
+
+def build_pick_pack_sku_index(pick_pack_df):
+    """Order No -> set of normalised SKU Codes picked on it, from the raw Pick Pack
+    frame. No SKU column / no frame -> {} (no proof: Order Enquiry fills no P)."""
+    if pick_pack_df is None or len(pick_pack_df) == 0 or "Order No" not in pick_pack_df.columns:
+        return {}
+    by_key = {re.sub(r"[\s_]+", "", str(c)).lower(): c for c in pick_pack_df.columns}
+    column = next((by_key[k] for k in PICK_PACK_SKU_HEADERS if k in by_key), None)
+    if column is None:
+        print("WARNING: Pick Pack has no SKU column - Order Enquiry cannot prove any SKU, "
+              "so it fills no Order No (P) this run.")
+        return {}
+    index = {}
+    for order, sku in zip(pick_pack_df["Order No"].map(normalize_value),
+                          pick_pack_df[column].map(normalize_value)):
+        if order and sku:
+            index.setdefault(order, set()).add(sku)
+    return index
 
 
 def build_full_flow(fms_df, assigned, pick_pack_lookup, warehouse_mapping, oe_records=None):
@@ -2487,7 +2541,7 @@ class _Slot:
     """One Full Flow row (existing) or FMS row (to be appended) taking part in matching."""
     __slots__ = ("kind", "ref", "gt", "base", "sku", "sku_alt", "order", "closed",
                  "anchor", "assigned", "tier", "oe_order", "oe_outcome", "_orders",
-                 "other_order")
+                 "other_order", "oe_unproven")
 
     def __init__(self, kind, ref, row):
         self.kind = kind
@@ -2506,6 +2560,12 @@ class _Slot:
         self.oe_outcome = None  # OrderEnquiryIndex.match outcome for a row left unmatched
         self._orders = None
         self.other_order = False  # anchor is a line of ANOTHER order than P (see allocate_lines)
+        self.oe_unproven = None   # GT-only Order Enquiry order refused for lack of SKU proof
+
+    @property
+    def skus(self):
+        """The row's SKU values (Vinculum SKU, SKU Code) for the Order Enquiry SKU proof."""
+        return tuple(s for s in (self.sku, self.sku_alt) if s)
 
     @property
     def orders(self):
@@ -2666,6 +2726,19 @@ def _other_order_slot(group, line_ids, records, lid):
     return None
 
 
+def match_slot_oe(slot, oe_index):
+    """Order Enquiry order for a blank-P slot with no Sales line, SKU-proven (see
+    OrderEnquiryIndex.match). Sets slot.oe_outcome (and slot.oe_unproven when the GT
+    points at one order but the row's SKU is not proven on it). -> order key or None."""
+    if oe_index is None:
+        slot.oe_outcome = "not_in_vinculum"
+        return None
+    order_key, slot.oe_outcome = oe_index.match(slot.gt, slot.base, slot.skus)
+    if slot.oe_outcome == "no_sku_proof":
+        slot.oe_unproven = oe_index.gt_only_order(slot.gt, slot.base)
+    return order_key
+
+
 def _pick_pack_cells(row, order_key, pick_pack_lookup, sheet_row, reason):
     """X (Actual.1) <- latest Pick Date, V (Warehouse Team) <- its Pick User, for the
     Vinculum Order No order_key; blank cells only."""
@@ -2742,7 +2815,8 @@ def plan_existing_writes(existing_df, slots, lines, pick_pack_lookup, warehouse_
              "order_no_oe_rows": 0, "order_no_oe_cells": 0,
              "other_order_rows": 0, "other_order_cells": 0,
              "oe_outcomes": {k: 0 for k in ("ambiguous", "only_cancelled", "unique_order_invoiced",
-                                            "unique_order_not_in_oe", "not_in_vinculum", "no_gt")}}
+                                            "unique_order_not_in_oe", "not_in_vinculum", "no_gt",
+                                            "no_sku_proof")}}
     writes = []
     for slot in slots:
         if slot.kind != "existing" or slot.closed:
@@ -2752,9 +2826,8 @@ def plan_existing_writes(existing_df, slots, lines, pick_pack_lookup, warehouse_
         if not slot.order:
             stats["blank_p_rows"] += 1
             if not slot.assigned:
-                order_key, outcome = (oe_index.match(slot.gt, slot.base) if oe_index is not None
-                                      else (None, "not_in_vinculum"))
-                slot.oe_outcome = outcome
+                order_key = match_slot_oe(slot, oe_index)
+                outcome = slot.oe_outcome
                 if order_key:
                     row_cells = _oe_cells(row, oe_index.records[order_key], order_key,
                                           pick_pack_lookup, 8 + int(i))
@@ -2828,13 +2901,14 @@ def plan_existing_writes(existing_df, slots, lines, pick_pack_lookup, warehouse_
 
 
 def plan_backfill(existing_df, sales_lines, pick_pack_lookup, warehouse_mapping,
-                  oe_orders=None):
+                  oe_orders=None, pick_pack_skus=None):
     """Existing rows only (no appends). Kept as the single entry point the tests use.
     oe_orders = prepare_oe_orders() output (daily Order Enquiry) or None.
+    pick_pack_skus = build_pick_pack_sku_index() output: SKU proof for Order Enquiry.
     Returns (writes, stats, slots, unplaced)."""
     slots = [_Slot("existing", i, row) for i, row in existing_df.iterrows()]
     unplaced = allocate_lines(slots, sales_lines)
-    oe_index = OrderEnquiryIndex(oe_orders, sales_lines, existing_df)
+    oe_index = OrderEnquiryIndex(oe_orders, sales_lines, existing_df, pick_pack_skus)
     writes, stats = plan_existing_writes(existing_df, slots, sales_lines,
                                          pick_pack_lookup, warehouse_mapping, oe_index)
     stats["unplaced_sales_lines"] = len(unplaced)
@@ -2959,6 +3033,356 @@ def report_order_no_mismatch(existing_df, slots, sales_lines, path=None):
     return report
 
 
+def report_oe_no_sku_proof(slots, limit=50):
+    """READ-ONLY log. Blank-P rows (existing or being appended) whose GT has one live,
+    not-invoiced Order Enquiry order that was NOT written because no line-level data puts
+    the row's SKU on it (2026-11-16 guard). -> number of such rows."""
+    skipped = [s for s in slots if s.oe_outcome == "no_sku_proof"]
+    print(f"Order-enquiry GT-only matches skipped (no SKU proof; P left blank): {len(skipped):,}")
+    for s in skipped[:limit]:
+        where = (f"row {8 + int(s.ref)}" if s.kind == "existing"
+                 else f"new row {int(s.ref) + 1} (append)")
+        print(f"  order-enquiry GT-only match skipped (no SKU proof): {where} GT {s.gt} "
+              f"order {s.oe_unproven} (SKU {s.sku or '-'})")
+    if len(skipped) > limit:
+        print(f"  ... {len(skipped) - limit:,} more")
+    return len(skipped)
+
+
+def report_order_no_without_sku_proof(existing_df, slots, oe_index, path=None,
+                                      skip_rows=()):
+    """READ-ONLY. Open rows whose P is filled, that no Sales line anchors, and whose P
+    orders are ALL known line by line (Pick Pack / Sales) without the row's SKU: P is
+    probably a sibling order of a split GT (e.g. stamped by the GT-only Order Enquiry
+    fill before 2026-11-16). P is never overwritten by the job; ops correct it.
+    orders_with_sku = other live orders of the GT whose lines do carry the SKU.
+    Rows filled from another order's line are in order_no_mismatch.csv instead."""
+    cols = ["sheet_row", "gt_number", "vinculum_sku", "sku_code", "order_no_in_p",
+            "skus_on_p_orders", "orders_with_sku"]
+    rows = []
+    evidence = oe_index.order_skus if oe_index is not None else {}
+    for slot in slots:
+        if slot.kind != "existing" or slot.closed or not slot.orders or slot.anchor is not None:
+            continue
+        if 8 + int(slot.ref) in skip_rows:
+            continue                      # P corrected from its invoice tonight
+        known = [evidence.get(o) for o in slot.orders]
+        if not all(known):
+            continue
+        row_skus = set(slot.skus)
+        on_p = set().union(*known)
+        if not row_skus or row_skus & on_p:
+            continue
+        siblings = (oe_index.by_base.get(slot.base, set()) - oe_index.cancelled
+                    - set(slot.orders))
+        with_sku = sorted(o for o in siblings if row_skus & evidence.get(o, set()))
+        rows.append({
+            "sheet_row": 8 + int(slot.ref), "gt_number": slot.gt, "vinculum_sku": slot.sku,
+            "sku_code": slot.sku_alt, "order_no_in_p": existing_df.at[slot.ref, "Order No"],
+            "skus_on_p_orders": " ".join(sorted(on_p)),
+            "orders_with_sku": " ".join(with_sku),
+        })
+    report = pd.DataFrame(rows, columns=cols)
+    print(f"Rows whose Order No (P) does not carry their SKU in Vinculum line data "
+          f"(suspected wrong P, NOT changed): {len(report):,}")
+    for _, r in report.head(10).iterrows():
+        print(f"  suspect P: row {r['sheet_row']} {r['gt_number']} / {r['vinculum_sku']} "
+              f"P={r['order_no_in_p']} -> SKU on {r['orders_with_sku'] or '-'}")
+    if path:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        report.to_csv(path, index=False)
+        print(f"Full list written to {path} (workflow artifact 'fullflow-reports').")
+    return report
+
+
+# ============================================================
+# VINCULUM CROSS-CHECK OF ORDER NO (P) AND QUANTITIES  -  2026-11-16
+# ============================================================
+# User: "can you not fix the quantiyt and order id overlapp all such issues at once it
+# just requires cross check with viniculum ... make sure this doesn't happen in future".
+#  (a) plan_invoice_order_fixes: P := the order of the row's own invoice (AW) when the
+#      Sales Master proves it. The ONE allowed overwrite of a filled cell; capped.
+#  (b) plan_qty_crosscheck: AS / J vs Vinculum lines; AS corrected only when one invoice
+#      line and one row make it unambiguous; everything else reported.
+#  (c) report_duplicate_order_nos: one Order No on rows of two unrelated GTs.
+# Record: "Errors and their fixes/2026-11-16-gt-only-order-fill-guard.md".
+
+# More invoice-proven P fixes than this in one night looks structural (e.g. a damaged
+# Sales Master): none is written, all are listed as held:over_cap.
+INVOICE_ORDER_NO_FIX_MAX = 200
+_INVOICE_SEPARATORS = re.compile(r"[,;|&\n]+")
+
+
+def split_invoice_nos(value):
+    """AW cell -> tuple of normalised invoice numbers (slashes are part of an invoice
+    number, "27/10/NM1/1273", so only , ; | & and new lines separate)."""
+    if not normalize_value(value):
+        return ()
+    out = []
+    for token in _INVOICE_SEPARATORS.split(str(value)):
+        inv = normalize_value(token)
+        if inv and inv.lower() not in CLOSED_MARKERS and inv not in out:
+            out.append(inv)
+    return tuple(out)
+
+
+def _num(value):
+    """Cell / line quantity -> float, or None when blank / not a number."""
+    if not value_found(value):
+        return None
+    number = pd.to_numeric(str(value).replace(",", "").strip(), errors="coerce")
+    return None if pd.isna(number) else float(number)
+
+
+def _qty_out(value):
+    return int(value) if float(value).is_integer() else float(value)
+
+
+def _line_records(sales_lines):
+    cols = ["_GT", "_GT_BASE", "_SKU", "_SKU_ALT", "_ORDER", "Order No", "Invoice No",
+            "Pick Qty"] + (["Orderqty"] if "Orderqty" in sales_lines.columns else [])
+    records = sales_lines[cols].to_dict("index")
+    by_invoice = {}
+    for lid, rec in records.items():
+        for inv in split_invoice_nos(rec["Invoice No"]):
+            by_invoice.setdefault(inv, []).append(lid)
+    return records, by_invoice
+
+
+def _write_report(report, path):
+    if path:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        report.to_csv(path, index=False)
+        print(f"Full list written to {path} (workflow artifact 'fullflow-reports').")
+
+
+def plan_invoice_order_fixes(existing_df, slots, sales_lines, oe_index,
+                             max_fixes=INVOICE_ORDER_NO_FIX_MAX, path=None):
+    """(a) Open rows with P filled and an invoice in AW. The invoice's Sales Master lines
+    of this GT + SKU name ONE order X that P does not contain -> P := X, but only when
+    every order in P is known line by line (Sales / Pick Pack, oe_index.order_skus) and
+    none of them carries this SKU. Otherwise the row is held (report only):
+      held:invoice_of_other_gt          the invoice is on another GT in Vinculum
+      held:invoice_has_no_line_for_sku  the invoice is on this GT, not for this SKU
+      held:invoice_spans_orders         the invoice lines name several orders
+      held:p_order_lines_unknown        a P order has no line-level data (not provable)
+      held:p_order_also_carries_sku     split line: P's order has this SKU too
+      held:over_cap                     more than max_fixes fixes tonight
+    -> (writes [(sheet_row, "Order No", X, "invoice_fix")], report DataFrame)."""
+    cols = ["sheet_row", "gt_number", "vinculum_sku", "order_no_in_p", "invoice_no",
+            "invoice_order", "action"]
+    records, by_invoice = _line_records(sales_lines)
+    evidence = oe_index.order_skus if oe_index is not None else {}
+    rows, fixes = [], []
+    for slot in slots:
+        if slot.kind != "existing" or slot.closed or not slot.orders:
+            continue
+        row = existing_df.loc[slot.ref]
+        lids = [l for inv in split_invoice_nos(row["Invoice No"]) for l in by_invoice.get(inv, [])]
+        if not lids:
+            continue                      # no invoice, or not in the Sales Master yet
+        same_gt = [l for l in lids if records[l]["_GT_BASE"] == slot.base]
+        inv_orders = sorted({records[l]["_ORDER"] for l in (same_gt or lids)})
+        if set(inv_orders) <= set(slot.orders):
+            continue                      # P agrees with its invoice
+        new_order = None
+        if not same_gt:
+            action = "held:invoice_of_other_gt"
+        else:
+            sku_lines = [l for l in same_gt if _match_tier(slot, records[l]) is not None]
+            if not sku_lines:
+                action = "held:invoice_has_no_line_for_sku"
+            elif len({records[l]["_ORDER"] for l in sku_lines}) > 1:
+                action = "held:invoice_spans_orders"
+            else:
+                known = [evidence.get(o) for o in slot.orders]
+                if not all(known):
+                    action = "held:p_order_lines_unknown"
+                elif set(slot.skus) & set().union(*known):
+                    action = "held:p_order_also_carries_sku"
+                else:
+                    action = "fixed"
+                    new_order = str(records[sku_lines[0]]["Order No"]).strip()
+                    inv_orders = [records[sku_lines[0]]["_ORDER"]]
+        entry = {"sheet_row": 8 + int(slot.ref), "gt_number": slot.gt,
+                 "vinculum_sku": slot.sku, "order_no_in_p": str(row["Order No"]).strip(),
+                 "invoice_no": str(row["Invoice No"]).strip(),
+                 "invoice_order": " ".join(inv_orders), "action": action}
+        rows.append(entry)
+        if new_order:
+            fixes.append((entry, new_order))
+
+    writes = []
+    if len(fixes) > max_fixes:
+        print(f"WARNING: {len(fixes):,} invoice-proven Order No (P) fixes is more than "
+              f"{max_fixes} - writing NONE tonight (check reports/order_no_invoice_fixes.csv).")
+        for entry, _ in fixes:
+            entry["action"] = "held:over_cap"
+    else:
+        for entry, new_order in fixes:
+            writes.append((entry["sheet_row"], "Order No", new_order, "invoice_fix"))
+            print(f"  invoice-proven P fix: row {entry['sheet_row']} GT {entry['gt_number']} / "
+                  f"{entry['vinculum_sku']} P {entry['order_no_in_p']} -> {new_order} "
+                  f"(invoice {entry['invoice_no']})")
+    report = pd.DataFrame(rows, columns=cols)
+    held = report[report["action"] != "fixed"]
+    print(f"Order No (P) corrected from the row's own invoice (AW): {len(writes):,}; "
+          f"held for a human (report only): {len(held):,}")
+    for action, count in held["action"].value_counts().items():
+        print(f"  {action:<36} {count:,}")
+    _write_report(report, path)
+    return writes, report
+
+
+def plan_qty_crosscheck(existing_df, slots, sales_lines, order_fixes=None, path=None):
+    """(b) Quantities against Vinculum lines (open rows, P = one order after tonight's
+    invoice fixes order_fixes):
+      dispatched_mismatch  sum AS of the rows of (P order, GT, SKU) != sum Pick Qty of
+                           its Sales lines (every row's AS filled, Vinculum picked > 0)
+      dispatched_fixed     same, but ONE row and ONE line and the row's AW is that
+                           line's invoice -> AS := Pick Qty (the only other overwrite)
+      order_qty_mismatch   J (FMS order qty, largest of the GT + SKU rows) != Vinculum
+                           Orderqty summed over the GT's orders (only when Vinculum has it)
+      qty_overlap          the same order + SKU on rows of two GTs (counted twice)
+    -> (writes [(sheet_row, "Dispatched Qty", qty, "qty_fix")], report DataFrame)."""
+    cols = ["check", "sheet_rows", "gt_number", "vinculum_sku", "order_no", "invoice_no",
+            "full_flow_qty", "vinculum_qty", "note"]
+    records, _ = _line_records(sales_lines)
+    has_orderqty = "Orderqty" in sales_lines.columns
+    fixed = {w[0]: normalize_value(w[2]) for w in (order_fixes or []) if w[1] == "Order No"}
+    lines_by_order_base, lines_by_base = {}, {}
+    for lid, rec in records.items():
+        lines_by_order_base.setdefault((rec["_ORDER"], rec["_GT_BASE"]), []).append(lid)
+        lines_by_base.setdefault(rec["_GT_BASE"], []).append(lid)
+
+    groups, by_gt_sku = {}, {}
+    for slot in slots:
+        if slot.kind != "existing" or slot.closed or not slot.sku or not slot.base:
+            continue
+        by_gt_sku.setdefault((slot.base, slot.sku), []).append(slot)
+        row_no = 8 + int(slot.ref)
+        orders = (fixed[row_no],) if row_no in fixed else slot.orders
+        if len(orders) == 1:
+            groups.setdefault((orders[0], slot.base, slot.sku), []).append(slot)
+
+    rows, writes = [], []
+
+    def add(check, members, order, ff_qty, vin_qty, invoice="", note=""):
+        rows.append({"check": check,
+                     "sheet_rows": " ".join(str(8 + int(m.ref)) for m in members),
+                     "gt_number": " ".join(sorted({m.gt for m in members})),
+                     "vinculum_sku": members[0].sku, "order_no": order, "invoice_no": invoice,
+                     "full_flow_qty": ff_qty, "vinculum_qty": vin_qty, "note": note})
+
+    for (order, base, sku), members in groups.items():
+        lids = [l for l in lines_by_order_base.get((order, base), [])
+                if _match_tier(members[0], records[l]) is not None]
+        if not lids:
+            continue
+        picks = [_num(records[l]["Pick Qty"]) for l in lids]
+        vin = sum(q for q in picks if q is not None)
+        ff_vals = [_num(existing_df.at[m.ref, "Dispatched Qty"]) for m in members]
+        if vin <= 0 or any(v is None for v in ff_vals) or sum(ff_vals) == vin:
+            continue
+        line_invoices = split_invoice_nos(records[lids[0]]["Invoice No"]) if len(lids) == 1 else ()
+        row_invoices = split_invoice_nos(existing_df.at[members[0].ref, "Invoice No"])
+        if len(members) == 1 and len(lids) == 1 and line_invoices \
+                and set(line_invoices) & set(row_invoices):
+            writes.append((8 + int(members[0].ref), "Dispatched Qty", _qty_out(vin), "qty_fix"))
+            add("dispatched_fixed", members, order, sum(ff_vals), vin,
+                invoice=" ".join(line_invoices), note="AS set to Vinculum Pick Qty")
+        else:
+            add("dispatched_mismatch", members, order, sum(ff_vals), vin,
+                note=f"{len(members)} row(s), {len(lids)} Vinculum line(s)")
+
+    if has_orderqty:
+        for (base, sku), members in by_gt_sku.items():
+            ff_j = [q for q in (_num(existing_df.at[m.ref, "Order Quantity"]) for m in members)
+                    if q is not None]
+            per_order = {}
+            for l in lines_by_base.get(base, []):
+                if _match_tier(members[0], records[l]) is None:
+                    continue
+                q = _num(records[l].get("Orderqty"))
+                if q is not None:
+                    o = records[l]["_ORDER"]
+                    per_order[o] = max(per_order.get(o, 0.0), q)
+            if not ff_j or not per_order:
+                continue
+            vin = sum(per_order.values())
+            if max(ff_j) != vin:
+                add("order_qty_mismatch", members, " ".join(sorted(per_order)), max(ff_j), vin,
+                    note="J (FMS order qty) vs Vinculum Orderqty over the GT's orders")
+
+    by_order_sku = {}
+    for (order, base, sku), members in groups.items():
+        by_order_sku.setdefault((order, sku), {})[base] = members
+    for (order, sku), per_base in by_order_sku.items():
+        if len(per_base) < 2:
+            continue
+        members = [m for base in sorted(per_base) for m in per_base[base]]
+        ff = [_num(existing_df.at[m.ref, "Dispatched Qty"]) for m in members]
+        skus = set(members[0].skus)
+        vin = [_num(rec["Pick Qty"]) for rec in records.values()
+               if rec["_ORDER"] == order and skus & {rec["_SKU"], rec["_SKU_ALT"]}]
+        add("qty_overlap", members, order, sum(q for q in ff if q is not None),
+            sum(q for q in vin if q is not None),
+            note="same order + SKU on rows of different GTs")
+
+    report = pd.DataFrame(rows, columns=cols)
+    counts = report["check"].value_counts().to_dict() if len(report) else {}
+    print(f"Quantity cross-check vs Vinculum: AS fixed {counts.get('dispatched_fixed', 0):,} | "
+          f"AS mismatch (report only) {counts.get('dispatched_mismatch', 0):,} | "
+          f"J vs Orderqty {counts.get('order_qty_mismatch', 0):,} | "
+          f"order+SKU on two GTs {counts.get('qty_overlap', 0):,}"
+          + ("" if has_orderqty else " (Sales has no Orderqty column: J not checked)"))
+    for r in rows:
+        if r["check"] == "dispatched_fixed":
+            print(f"  qty fix: row {r['sheet_rows']} {r['gt_number']} / {r['vinculum_sku']} "
+                  f"AS {r['full_flow_qty']:g} -> {r['vinculum_qty']:g} "
+                  f"({r['order_no']}, invoice {r['invoice_no']})")
+    for r in [r for r in rows if r["check"] != "dispatched_fixed"][:10]:
+        print(f"  {r['check']}: rows {r['sheet_rows']} {r['gt_number']} / {r['vinculum_sku']} "
+              f"order {r['order_no']} Full Flow {r['full_flow_qty']:g} vs Vinculum "
+              f"{r['vinculum_qty']:g}")
+    _write_report(report, path)
+    return writes, report
+
+
+def report_duplicate_order_nos(existing_df, sales_lines, path=None):
+    """(c) READ-ONLY. An Order No in P of rows of two unrelated GTs (different GT base;
+    the R/T/F repunch family of one GT shares its base and is fine). vinculum_gt = the
+    ExtOrderNo(s) the Sales Master has for that order."""
+    per_order = {}
+    for i, (gt_raw, p) in enumerate(zip(existing_df["GT Number"], existing_df["Order No"])):
+        base = gt_base(gt_raw)
+        if not base:
+            continue
+        for order in split_order_nos(p):
+            per_order.setdefault(order, {}).setdefault(base, []).append(
+                (8 + i, normalize_value(gt_raw)))
+    vin_gt = {}
+    for order, gt in zip(sales_lines["_ORDER"], sales_lines["_GT"]):
+        if order and gt:
+            vin_gt.setdefault(order, set()).add(gt)
+    rows = []
+    for order, per_base in per_order.items():
+        if len(per_base) < 2:
+            continue
+        hits = sorted(h for hs in per_base.values() for h in hs)
+        rows.append({"order_no": order,
+                     "gt_numbers": " ".join(sorted({gt for _, gt in hits})),
+                     "sheet_rows": " ".join(str(r) for r, _ in hits),
+                     "vinculum_gt": " ".join(sorted(vin_gt.get(order, set())))})
+    report = pd.DataFrame(rows, columns=["order_no", "gt_numbers", "sheet_rows", "vinculum_gt"])
+    print(f"Order Nos on rows of two unrelated GTs: {len(report):,}")
+    for _, r in report.head(10).iterrows():
+        print(f"  duplicate order: {r['order_no']} on {r['gt_numbers']} (rows {r['sheet_rows']}); "
+              f"Vinculum GT {r['vinculum_gt'] or '-'}")
+    _write_report(report, path)
+    return report
+
+
 _GT_REF = re.compile(r"^GT\d")
 _ORDER_TOKEN = re.compile(r"[A-Z0-9]+")
 
@@ -3052,6 +3476,9 @@ UNMATCHED_REASONS = {
     "sku_differs": "GT invoiced (Sales Master) but no line for this SKU",
     "punched_not_invoiced_multi_order": "punched, not invoiced, GT has >1 live Vinculum order "
                                         "(order-level Order Enquiry cannot pick one)",
+    "punched_not_invoiced_no_sku_proof": "punched, not invoiced, GT has one live order but "
+                                         "no Pick Pack / Sales line puts this SKU on it "
+                                         "(P left blank; GT may be split)",
     "vinculum_order_cancelled": "every Vinculum order of the GT is Cancelled",
     "gt_not_in_vinculum": "GT in neither Sales Master nor Order Enquiry (not punched yet, "
                           "or punched before the daily files start)",
@@ -3096,6 +3523,7 @@ def _print_unmatched_diagnostics(existing_df, slots, sales_lines, limit=15, path
                                + ", ".join(vin[:8]))
         else:
             reason = {"ambiguous": "punched_not_invoiced_multi_order",
+                      "no_sku_proof": "punched_not_invoiced_no_sku_proof",
                       "only_cancelled": "vinculum_order_cancelled"}.get(slot.oe_outcome,
                                                                          "gt_not_in_vinculum")
             vin = []
@@ -3237,6 +3665,8 @@ def main():
         pick_pack_lookup = build_pick_pack_lookup(pick_pack_df.copy())
     except SystemExit:
         pick_pack_lookup = {}
+    pick_pack_skus = build_pick_pack_sku_index(pick_pack_df)
+    print(f"Pick Pack orders with SKU lines (SKU proof for Order Enquiry): {len(pick_pack_skus):,}")
 
     # --------------------------------------------------------
     # WHICH FMS ROWS ARE MISSING FROM FULL FLOW
@@ -3293,13 +3723,13 @@ def main():
     new_slots = [_Slot("new", pos, row)
                  for pos, (_, row) in enumerate(fms_to_append.iterrows())]
     unplaced = allocate_lines(slots + new_slots, sales_lines)
-    oe_index = OrderEnquiryIndex(oe_orders, sales_lines, existing_full_flow_df)
+    oe_index = OrderEnquiryIndex(oe_orders, sales_lines, existing_full_flow_df, pick_pack_skus)
 
     writes, stats = plan_existing_writes(existing_full_flow_df, slots, sales_lines,
                                          pick_pack_lookup, warehouse_mapping, oe_index)
     for s in new_slots:
         if not s.assigned:
-            s.oe_order, s.oe_outcome = oe_index.match(s.gt, s.base)
+            s.oe_order = match_slot_oe(s, oe_index)
 
     # A genuine Order No found tonight wins over the sentinel (and over a clear).
     writes, refilled = merge_order_no_writes(writes, order_no_marks, order_no_clears)
@@ -3334,7 +3764,9 @@ def main():
     print(f"  Order Enquiry could not resolve them: GT has >1 live order {o['ambiguous']:,} | "
           f"only cancelled orders {o['only_cancelled']:,} | unique order already invoiced "
           f"(SKU not on it) {o['unique_order_invoiced']:,} | unique order known only from P "
-          f"{o['unique_order_not_in_oe']:,} | GT in no Vinculum source {o['not_in_vinculum']:,}")
+          f"{o['unique_order_not_in_oe']:,} | GT in no Vinculum source {o['not_in_vinculum']:,} | "
+          f"one order but SKU not proven on it {o['no_sku_proof']:,}")
+    report_oe_no_sku_proof(slots + new_slots)
     print(f"Rows with Order No anchored to a Vinculum line: {stats['anchored_rows']:,}")
     print(f"  of which get blank cells refreshed:         {stats['refreshed_rows']:,}")
     print(f"  refresh cells:                              {stats['refresh_cells']:,}")
@@ -3387,6 +3819,26 @@ def main():
     report_order_no_mismatch(
         existing_full_flow_df, slots, sales_lines,
         path=os.path.join("reports", "order_no_mismatch.csv"))
+
+    print("\n" + "=" * 80)
+    print("VINCULUM CROSS-CHECK: ORDER NO (P) BY INVOICE, QUANTITIES, DUPLICATE ORDERS")
+    print("=" * 80)
+    invoice_fixes, _ = plan_invoice_order_fixes(
+        existing_full_flow_df, slots, sales_lines, oe_index,
+        path=os.path.join("reports", "order_no_invoice_fixes.csv"))
+    qty_fixes, _ = plan_qty_crosscheck(
+        existing_full_flow_df, slots, sales_lines, order_fixes=invoice_fixes,
+        path=os.path.join("reports", "qty_crosscheck.csv"))
+    report_duplicate_order_nos(
+        existing_full_flow_df, sales_lines,
+        path=os.path.join("reports", "duplicate_order_nos.csv"))
+    report_order_no_without_sku_proof(
+        existing_full_flow_df, slots, oe_index,
+        path=os.path.join("reports", "order_no_suspect_no_sku.csv"),
+        skip_rows={w[0] for w in invoice_fixes})
+    # The two overwrites allowed (invoice-proven P, unambiguous AS); every other write
+    # above is blank-cells-only.
+    writes = writes + invoice_fixes + qty_fixes
 
     report_vinculum_gt_orders_not_in_full_flow(
         oe_orders, sales_lines, existing_full_flow_df, fms_df,

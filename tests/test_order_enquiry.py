@@ -10,6 +10,8 @@ exports hold every punched order, but ORDER-LEVEL only (no SKU, no Created By). 
     ONLY when its GT (exact, else R/T/F-stripped base; never A1<->A10) has exactly ONE
     live Vinculum order (Order Enquiry + Sales Master + Full Flow P), and that order is
     not invoiced (an invoiced order is the Sales Master's, which is line-level)
+  - since 2026-11-16 also only when line-level data (Pick Pack) puts the row's SKU on
+    that order (test_oe_sku_proof.py); the fills below therefore pass pick_pack_skus
   - cancelled orders are ignored; Sales Master wins when both have a value
   - blank cells only, closed rows untouched, idempotent
 """
@@ -130,6 +132,7 @@ def test_oe_fills_p_s_for_uninvoiced_order(make):
         [{"GT Number": "GT061026A4", "Vinculum SKU": "S1"},
          {"GT Number": "GT061026A4", "Vinculum SKU": "S2"}],
         [],                                                     # not invoiced: no Sales line
+        pick_pack_skus={"NM11832": {"S1", "S2"}},
         oe_rows=[{"Order No": "NM11832", "ExtOrderNo": "GT061026A4",
                   "Order Date": "06/10/2026 06:27 PM", "Status": "Shipped complete"}])
     c = make.cells(writes)
@@ -145,6 +148,7 @@ def test_oe_fills_p_s_for_uninvoiced_order(make):
 
 def test_oe_team_when_export_has_created_by(make):
     writes, _ = make.plan([{"GT Number": "GT1", "Vinculum SKU": "S"}], [],
+                          pick_pack_skus={"N1": {"S"}},
                           oe_rows=[{"Order No": "N1", "ExtOrderNo": "GT1", "Created by": "Gauri"}])
     assert make.cells(writes)[(8, "Team")] == "Gauri"
 
@@ -153,6 +157,7 @@ def test_oe_fill_brings_pick_pack_v_x(make):
     writes, _ = make.plan(
         [{"GT Number": "GT1", "Vinculum SKU": "S"}], [],
         pick_pack={"N1": {"Pick Date": pd.Timestamp("2026-10-07 10:00"), "Pick User": "Bidyut"}},
+        pick_pack_skus={"N1": {"S"}},
         oe_rows=[{"Order No": "N1", "ExtOrderNo": "GT1"}])
     c = make.cells(writes)
     assert c[(8, "Warehouse Team")] == "Bidyut" and (8, "Actual.1") in c
@@ -214,6 +219,7 @@ def test_full_flow_p_counts_as_an_order(make):
 def test_cancelled_orders_ignored(make):
     writes, stats = make.plan(
         [{"GT Number": "GT1", "Vinculum SKU": "S"}, {"GT Number": "GT2", "Vinculum SKU": "S"}], [],
+        pick_pack_skus={"C1": {"S"}, "N2": {"S"}},
         oe_rows=[{"Order No": "C1", "ExtOrderNo": "GT1", "Status": "Cancelled"},
                  {"Order No": "C2", "ExtOrderNo": "GT2", "Status": "Cancelled"},
                  {"Order No": "N2", "ExtOrderNo": "GT2", "Status": "Allocated"}])
@@ -227,7 +233,7 @@ def test_suffix_exact_first_then_base(make):
     writes, _ = make.plan(
         [{"GT Number": "GT081026A2R", "Vinculum SKU": "S"},     # exact R order is unique
          {"GT Number": "GT091026A5T", "Vinculum SKU": "S"}],    # no exact -> base, unique
-        [],
+        [], pick_pack_skus={o: {"S"} for o in ("NR", "NT1", "NT2", "N5")},
         oe_rows=[{"Order No": "NR", "ExtOrderNo": "GT081026A2R"},
                  {"Order No": "NT1", "ExtOrderNo": "GT081026A2T"},
                  {"Order No": "NT2", "ExtOrderNo": "GT081026A2T"},
@@ -240,6 +246,7 @@ def test_a1_never_takes_a10(make):
     writes, _ = make.plan(
         [{"GT Number": "GT081026A1", "Vinculum SKU": "S"},
          {"GT Number": "GT081026A10R", "Vinculum SKU": "S"}], [],
+        pick_pack_skus={"N10": {"S"}},
         oe_rows=[{"Order No": "N10", "ExtOrderNo": "GT081026A10"}])
     c = make.cells(writes)
     assert (8, "Order No") not in c and c[(9, "Order No")] == "N10"
@@ -250,7 +257,7 @@ def test_never_overwrite_and_closed_untouched(make):
         [{"GT Number": "GT1", "Vinculum SKU": "S", "Actual": "01-Oct-2026 10:00:00"},  # S kept
          {"GT Number": "GT2", "Vinculum SKU": "S", "Status": "Cancelled"},             # closed
          {"GT Number": "GT3", "Vinculum SKU": "S", "Order No": "N3"}],                 # P kept
-        [],
+        [], pick_pack_skus={o: {"S"} for o in ("N1", "N2", "N3")},
         oe_rows=[{"Order No": "N1", "ExtOrderNo": "GT1"}, {"Order No": "N2", "ExtOrderNo": "GT2"},
                  {"Order No": "N3", "ExtOrderNo": "GT3"}])
     c = make.cells(writes)
@@ -264,12 +271,13 @@ def test_idempotent(ff, make):
                               {"GT Number": "GT1", "Vinculum SKU": "S2"}])
     oe = make.oe([{"Order No": "N1", "ExtOrderNo": "GT1"}])
     sales = make.sales([])
-    writes, *_ = ff.plan_backfill(existing, sales, {}, {}, oe_orders=oe)
+    proof = {"N1": {"S1", "S2"}}
+    writes, *_ = ff.plan_backfill(existing, sales, {}, {}, oe_orders=oe, pick_pack_skus=proof)
     assert len(writes) == 4
     after = existing.astype(object)
     for sheet_row, column, value, _ in writes:
         after.at[sheet_row - 8, column] = value
-    again, stats, *_ = ff.plan_backfill(after, sales, {}, {}, oe_orders=oe)
+    again, stats, *_ = ff.plan_backfill(after, sales, {}, {}, oe_orders=oe, pick_pack_skus=proof)
     assert again == [] and stats["oe_filled_rows"] == 0
 
 
@@ -286,8 +294,8 @@ def test_new_row_filled_from_oe(ff, make):
     existing = make.existing([])
     oe_index = ff.OrderEnquiryIndex(make.oe([{"Order No": "N9", "ExtOrderNo": "GT091026A3",
                                               "Order Date": "09/10/2026 04:00 PM"}]),
-                                    make.sales([]), existing)
-    rec = oe_index.records[oe_index.match("GT091026A3", "GT091026A3")[0]]
+                                    make.sales([]), existing, order_skus={"N9": {"S"}})
+    rec = oe_index.records[oe_index.match("GT091026A3", "GT091026A3", ("S",))[0]]
     built = ff.build_full_flow(fms, [[]], {}, {}, oe_records=[rec])
     assert built.iloc[0]["Order No"] == "N9"
     assert built.iloc[0]["Actual"] == pd.Timestamp("2026-10-09 16:00")
@@ -305,7 +313,8 @@ def test_unmatched_classification(ff, make, tmp_path):
     oe = make.oe([{"Order No": "A", "ExtOrderNo": "GT1"}, {"Order No": "B", "ExtOrderNo": "GT1"},
                   {"Order No": "C", "ExtOrderNo": "GT2", "Status": "Cancelled"},
                   {"Order No": "E", "ExtOrderNo": "GT5"}])
-    writes, stats, slots, _ = ff.plan_backfill(existing, sales, {}, {}, oe_orders=oe)
+    writes, stats, slots, _ = ff.plan_backfill(existing, sales, {}, {}, oe_orders=oe,
+                                               pick_pack_skus={"E": {"S"}})
     path = tmp_path / "u.csv"
     ff._print_unmatched_diagnostics(existing, slots, sales, path=str(path),
                                     oe_index=ff.OrderEnquiryIndex(oe, sales, existing))

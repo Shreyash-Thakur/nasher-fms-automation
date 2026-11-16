@@ -138,6 +138,7 @@ def test_blank_vinculum_columns_of_apps_script_row_are_filled(ff, make):
 def test_apps_script_row_gets_order_no_from_daily_order_enquiry(ff, make):
     writes, stats = make.plan(
         [_apps_script_row_as_read(ff)], [],
+        pick_pack_skus={"N89702": {_apps_script_row_as_read(ff)["Vinculum SKU"]}},
         oe_rows=[{"Order No": "N89702", "ExtOrderNo": "GT121026A1"}])
     assert make.cells(writes)[(8, "Order No")] == "N89702"
 

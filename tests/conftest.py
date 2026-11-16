@@ -87,11 +87,14 @@ def make(ff):
         return ff.prepare_oe_orders(pd.DataFrame([{**base, **r} for r in rows]))
 
     def plan(existing_rows, sales_rows, warehouse_mapping=None, pick_pack=None, oe_rows=None,
-             full=False):
+             full=False, pick_pack_skus=None):
+        """pick_pack_skus = {Order No: {SKU, ...}} (Pick Pack lines): the SKU proof an
+        Order Enquiry fill needs (2026-11-16)."""
         result = ff.plan_backfill(
             existing(existing_rows), sales(sales_rows), pick_pack or {},
             warehouse_mapping or {"W1": "Vadape"},
-            oe_orders=oe(oe_rows) if oe_rows is not None else None)
+            oe_orders=oe(oe_rows) if oe_rows is not None else None,
+            pick_pack_skus=pick_pack_skus)
         return result if full else result[:2]
 
     def cells(writes):
