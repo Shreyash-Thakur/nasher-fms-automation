@@ -118,9 +118,9 @@ def test_sentinel_not_a_candidate_order_for_siblings(ff, make):
 
 
 def test_pod_never_matches_sentinel(pod, monkeypatch):
-    monkeypatch.setattr(pod, "exact_index", {
-        "GT1|CANCELLED": {"date": datetime(2026, 9, 10), "url": "https://drive/x"}})
-    assert pod.find_pod(pod.exact_index, {}, "GT1", "Cancelled") == (None, "")
+    monkeypatch.setattr(pod, "pod_index", {
+        "CANCELLED": [{"gt": "GT1", "date": datetime(2026, 9, 10), "url": "https://drive/x"}]})
+    assert pod.find_pod(pod.pod_index, {}, "GT1", "Cancelled") == (None, "")
     row = [""] * 48
     row[pod.COL_GT - 1], row[pod.COL_ORDER - 1] = "GT1", "Cancelled"
     rows_checked, matched, *_, updates = pod.build_sheet_update_requests([row])

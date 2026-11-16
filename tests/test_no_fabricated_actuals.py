@@ -135,8 +135,8 @@ def _pod_row(pod, **cells):
 
 
 def test_ap_written_date_only(pod, monkeypatch):
-    monkeypatch.setattr(pod, "exact_index", {
-        "GT1|N1": {"date": datetime(2026, 9, 10), "url": "https://drive/x"}})
+    monkeypatch.setattr(pod, "pod_index", {
+        "N1": [{"gt": "GT1", "date": datetime(2026, 9, 10), "url": "https://drive/x"}]})
     *_, updates = pod.build_sheet_update_requests([_pod_row(pod, C="GT1", P="N1")])
     cells = {u["range"]: u["values"][0][0] for u in updates}
     assert cells["'Full Flow FMS'!AP8"] == "10-Sep-2026"

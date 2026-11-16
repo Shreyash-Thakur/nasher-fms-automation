@@ -19,8 +19,8 @@ def sheet_row(pod, **cells):
 
 @pytest.fixture
 def with_pod(pod, monkeypatch):
-    monkeypatch.setattr(pod, "exact_index", {
-        "GT1|N1": {"date": datetime(2026, 9, 10), "url": "https://drive/x"},
+    monkeypatch.setattr(pod, "pod_index", {
+        "N1": [{"gt": "GT1", "date": datetime(2026, 9, 10), "url": "https://drive/x"}],
     })
     return pod
 

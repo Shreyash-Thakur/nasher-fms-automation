@@ -1,0 +1,69 @@
+# Nightly POD job mapped PODs by GT + Order (wrong / missing GT never linked) and overwrote AJ "RTV" with "Delivered"
+
+- **Date:** 2026-11-16
+- **Reported as:**
+  - "also stop maping POD because of GT number fetch it based on order id"
+  - "Kindly provide an option to mark the invoice status as "RTV" (Return to Vendor) in the POD Update Sheet."
+- **Symptom:**
+  - **Wrong / missing GT:** a POD file whose name has a wrong GT (a typo, or the GT of a sister order) or no GT never matched its row, even when the Order No in the name was correct. The row stayed with AJ / AP / AU / AV blank. The GT_FMS web app was changed the same day (GT_FMS 0ad435d); this nightly job still mapped by GT.
+  - **RTV:** the GT_FMS POD dashboard's new RTV button writes AJ "RTV" on the invoice's lines (GT_FMS b3786e3). This job did not know "RTV". If a POD file matched an RTV line, it filled AP / AU / AV and changed AJ to "Delivered".
+- **Where (at 506364c):**
+  - `scripts/gt_full_flow_fms_pod_update_google_sheet_gt_and_order_only.py`
+    - `build_pod_index` (lines ~745-899): `exact_index` keyed `"GT|ORDER"` and `"normGT|ORDER"`.
+    - `find_pod` (line 912): exact GT + Order, then normalized GT + Order, else no match. Col P was compared as one whole cell.
+    - `CLOSED_MARKERS` (line 1075): `{"cancelled", "virtual invoice", "out of stock", "oos"}`, no "rtv".
+  - `scripts/gt_full_flow_fms_yes_no_all_or_latest.py` `CLOSED_MARKERS` (line 2267): no "rtv" either.
+- **Root cause:**
+  - **GT + Order:** the GT was a hard part of the key, not a hint. The Order No is the unique Vinculum key.
+  - **RTV:** RTV is a new closed status, added to GT_FMS on 16-Nov. The Python closed list was never updated for it.
+- **Why it wasn't caught:**
+  - The tests patched `exact_index` with `"GT1|N1"` keys and only checked rows whose GT and Order both matched. No test had a file with a wrong GT, a missing GT, or a shared order.
+  - "RTV" did not exist before 16-Nov.
+- **Fix:**
+  - **POD job: order-first mapping** (mirrors GT_FMS Pod_Upload.js `gtpOrderRows_`):
+    - `build_pod_index` returns `pod_index = {ORDER: [POD records]}`, keyed by `normalize_order` alone. The order part of a structured name is split, so `"N5, N6"` indexes both. Every file of an order is kept, with the GT from its name.
+    - `parse_structured_pod_filename` also accepts a name without a GT (`"POD | N100 | 05-11-2026 | x"` or `" | POD | N100 | …"`, which is what GT_FMS `gtpPodFileName_` writes for a blank GT).
+    - New `split_orders(cell)` splits col P (and the name's order part) on comma / semicolon / space, upper-cased and trimmed. Closed markers are never an order.
+    - New `build_order_families(values)` maps each Order No to the `normalize_gt` families of every sheet row (with a GT) that lists it.
+    - `find_pod(pod_index, order_families, gt, order)`:
+      - When all rows carrying the order are one family (a GT and its R / T repunch), any file of that order is accepted ("Order No").
+      - When the order is on unrelated GTs, only a file whose GT family is this row's family is accepted ("Order No + GT tie-breaker").
+      - When no file names one of those families, the order is **AMBIGUOUS**: nothing is written, and it goes to `ambiguous_orders`, which `main()` prints as `AMBIGUOUS <order>: sheet GTs …; file GT …`.
+      - When several files or orders match, the latest POD date wins.
+    - Unchanged:
+      - `row_is_cancelled` (closed rows never written).
+      - Blank-only AP / AU / AV.
+      - The AJ stage ladder.
+      - GT-only matching stays disabled. GT + Date files without an order are counted only.
+  - **RTV is a closed status:**
+    - `"rtv"` added to `CLOSED_MARKERS` in the POD job. AJ "RTV" (C or P:AW) is never overwritten: no "Delivered", no AJ stage, no AP / AU / AV.
+    - `"rtv"` added to `CLOSED_MARKERS` in `yes_no_all_or_latest`, so `row_is_closed` treats an RTV line like Cancelled (no backfill / refresh) and `split_order_nos("RTV")` is empty.
+    - `planned_status_..._v3.py` has no closed-row check and never reads or writes AJ, so it needs no change.
+  - **Tests:**
+    - New `tests/test_pod_by_order.py` (15 tests). It covers:
+      - a wrong GT in the file name;
+      - a missing GT;
+      - an order listed with others in P;
+      - GT + GT…R sharing an order (both written);
+      - unrelated GTs (no GT / another GT gives AMBIGUOUS; the right GT's family breaks the tie);
+      - the latest POD wins;
+      - blank-only writes;
+      - AJ RTV untouched with and without a POD;
+      - yes_no `row_is_closed` with RTV.
+    - Four existing tests moved from `exact_index` `"GT|ORDER"` to `pod_index` (`test_pod.py`, `test_aj_status_stages.py`, `test_cancelled_order_no.py`, `test_no_fabricated_actuals.py`).
+- **Evidence:**
+  - `python -m pytest tests/test_pod_by_order.py -q` with the scripts at 506364c (fix stashed): `15 failed in 0.35s`.
+  - After the fix: `15 passed in 0.03s`.
+  - Full suite `python -m pytest tests -q`: before `258 passed in 1.89s`, after `273 passed in 1.30s`.
+  - Offline `build_pod_index` with a fake Drive listing: `GT999999A9 | POD | N89705 | …`, `" | POD | N5, N6 | …"` and a GT + date file gave `Structured POD files: 2`, `GT + Date files (unused): 1`, index keys `['N5', 'N6', 'N89705']`.
+  - Not run against the live sheet.
+- **Blast radius:**
+  - The nightly job ("Run POD update" step of run_fms.yml) can now link POD files whose name GT is wrong or missing. A row whose P lists several orders is written by a POD of any of them.
+  - Writes are still blank-only for AP / AU / AV. AJ only moves up the ladder.
+  - An order on unrelated GTs is written only on the family the file names, which is what GT + Order did before. A file naming none of them writes nothing, as before, but is now reported as AMBIGUOUS.
+  - Rows with AJ "RTV" are now closed for both nightly scripts. The yes_no job no longer refreshes or fills their P / Q / S / AW / AS etc. The fill-rate table counts them as closed.
+- **Still open:**
+  - Free-form names without a GT and without the "| POD |" structure (e.g. `POD N89705 05-11-2026.pdf`) are still not matched by this job. GT_FMS's 15-min Drive sync links them by order token.
+  - KASA_FMS `alert.js` / `KasaFmsDashboard.js` / `invoice.js` RTV handling is as listed in GT_FMS `2026-11-16-order-cancel-and-rtv.md` (not this repo).
+  - Invoice 27/10/GJ1/302 is not marked RTV by this change (sheet data; the user confirms first).
+- **Related:** GT_FMS `Errors and their fixes/2026-11-16-pod-mapped-by-order-no.md`, `2026-11-16-order-cancel-and-rtv.md` (GT_FMS 0ad435d / b3786e3, `Pod_Upload.js gtpOrderRows_`); `2026-11-01` AJ stages; `2026-10-12` "Cancelled" in Order No sentinel.

@@ -169,6 +169,22 @@ def normalize_order(order):
     ).strip().upper()
 
 
+# 2026-11-16: a col P cell (or the order part of a POD file name) can list several
+# Order Nos ("N012271, N461768" = one per warehouse part). Same split as GT_FMS
+# Pod_Upload.js gtpOrderList_: upper-case, trimmed, split on comma / semicolon / space.
+_ORDER_LIST_SEPARATORS = re.compile(r"[\s,;]+")
+
+
+def split_orders(value):
+    """Cell -> list of normalised Order Nos; closed markers ("Cancelled", "RTV" ...)
+    are never an order."""
+    out = []
+    for token in _ORDER_LIST_SEPARATORS.split(normalize_order(value)):
+        if token and token.lower() not in CLOSED_MARKERS and token not in out:
+            out.append(token)
+    return out
+
+
 # ============================================================
 # PARSE DATE
 # ============================================================
@@ -401,12 +417,19 @@ def parse_structured_pod_filename(filename):
         return None
 
     # --------------------------------------------------------
-    # First part should be GT
+    # First part should be GT. 2026-11-16: the GT is only a
+    # tie-breaker now (PODs map by Order No), so a name without
+    # one (" | POD | N100 | 05-11-2026 | x.pdf", what GT_FMS
+    # gtpPodFileName_ writes for a blank GT) is also structured.
     # --------------------------------------------------------
 
     gt = parts[0].strip().upper()
 
-    if not gt.startswith("GT"):
+    if gt == "POD":
+
+        gt = ""
+
+    elif not gt.startswith("GT"):
 
         return None
 
@@ -742,113 +765,30 @@ def build_pod_index(drive):
             break
 
     # ========================================================
-    # BUILD EXACT GT + ORDER INDEX
+    # BUILD ORDER NO INDEX
+    #
+    # 2026-11-16, user: "also stop maping POD because of GT
+    # number fetch it based on order id". The index is keyed by
+    # the Order No ALONE; every POD file of that order is kept
+    # (with the GT from its name, which is only a tie-breaker in
+    # find_pod). Before, the key was "GT|ORDER" / "normGT|ORDER",
+    # so a file named with a wrong or missing GT never matched.
+    # GT + Date files without an Order No are still not used
+    # (GT-only matching stays disabled).
     # ========================================================
 
     print()
     print("-" * 80)
-    print("BUILDING POD INDEXES")
+    print("BUILDING POD INDEX (by Order No)")
     print("-" * 80)
 
-    exact_index = {}
-
-    gt_index = {}
-
-    # ========================================================
-    # EXACT GT + ORDER
-    # ========================================================
+    pod_index = {}
 
     for record in structured_records:
 
-        gt = record["gt"]
+        for order in split_orders(record["order"]):
 
-        order = normalize_order(
-            record["order"]
-        )
-
-        if not order:
-            continue
-
-        gt_norm = normalize_gt(
-            gt
-        )
-
-        # ----------------------------------------------------
-        # Exact GT + Order
-        # ----------------------------------------------------
-
-        key = (
-            f"{gt}|{order}"
-        )
-
-        # Keep latest POD
-        if (
-            key not in exact_index
-            or record["date"]
-            > exact_index[key]["date"]
-        ):
-
-            exact_index[key] = record
-
-        # ----------------------------------------------------
-        # Normalized GT + Order
-        # ----------------------------------------------------
-
-        normalized_key = (
-            f"{gt_norm}|{order}"
-        )
-
-        if (
-            normalized_key not in exact_index
-            or record["date"]
-            > exact_index[
-                normalized_key
-            ]["date"]
-        ):
-
-            exact_index[
-                normalized_key
-            ] = record
-
-    # ========================================================
-    # GT-ONLY INDEX
-    # ========================================================
-
-    for record in all_gt_records:
-
-        gt = record["gt"]
-
-        gt_norm = normalize_gt(
-            gt
-        )
-
-        # ----------------------------------------------------
-        # Exact GT
-        # ----------------------------------------------------
-
-        if (
-            gt not in gt_index
-            or record["date"]
-            > gt_index[gt]["date"]
-        ):
-
-            gt_index[gt] = record
-
-        # ----------------------------------------------------
-        # Normalized GT
-        # ----------------------------------------------------
-
-        if (
-            gt_norm not in gt_index
-            or record["date"]
-            > gt_index[
-                gt_norm
-            ]["date"]
-        ):
-
-            gt_index[
-                gt_norm
-            ] = record
+            pod_index.setdefault(order, []).append(record)
 
     # ========================================================
     # SUMMARY
@@ -870,7 +810,7 @@ def build_pod_index(drive):
     )
 
     print(
-        f"GT + Date fallback files : "
+        f"GT + Date files (unused) : "
         f"{parsed_gt_only}"
     )
 
@@ -885,24 +825,38 @@ def build_pod_index(drive):
     )
 
     print(
-        f"GT + Order index keys    : "
-        f"{len(exact_index)}"
-    )
-
-    print(
-        f"GT-only index keys       : "
-        f"{len(gt_index)}"
+        f"Order No index keys      : "
+        f"{len(pod_index)}"
     )
 
     print("=" * 80)
 
-    return exact_index, gt_index
+    return pod_index
 
 
-# POD indexes are populated once in main() and then used by the row matcher.
-exact_index = {}
-gt_index = {}
-closed_skipped = 0   # rows with a POD that were left alone because they are closed
+# POD index ({ORDER: [POD records]}) is populated once in main() and then used by the
+# row matcher.
+pod_index = {}
+closed_skipped = 0     # rows with a POD that were left alone because they are closed
+ambiguous_orders = {}  # ORDER -> (GT families on the sheet, file GTs) — POD not written
+
+
+# ============================================================
+# ORDER NO -> GT FAMILIES ON THE SHEET
+# ============================================================
+
+def build_order_families(values):
+    """{ORDER: {normalize_gt(C), ...}} over every Full Flow row with a GT whose col P
+    lists that order (a cell may list several). Rows with a blank C are skipped here
+    exactly as in build_sheet_update_requests."""
+    families = {}
+    for row in values:
+        gt = get_cell(row, COL_GT)
+        if not gt:
+            continue
+        for order in split_orders(get_cell(row, COL_ORDER)):
+            families.setdefault(order, set()).add(normalize_gt(gt))
+    return families
 
 
 # ============================================================
@@ -910,84 +864,69 @@ closed_skipped = 0   # rows with a POD that were left alone because they are clo
 # ============================================================
 
 def find_pod(
-    exact_index,
-    gt_index,
+    pod_index,
+    order_families,
     gt_number,
     order_number
 ):
     """
-    Find a POD ONLY when BOTH GT Number and Order No are present
-    and BOTH match the POD data.
+    Find the POD of a Full Flow row by its ORDER NO (2026-11-16).
 
-    Matching priority:
-      1. Exact GT + Order
-      2. Normalized GT + Order
+    Mirrors GT_FMS Pod_Upload.js gtpOrderRows_:
+      - col P is split into its Order Nos; each one is looked up in the POD index
+        (keyed by Order No alone, whatever GT the file name carries, or none).
+      - Every row carrying that order belongs to ONE GT family (normalize_gt: GT and
+        its R / T repunch) -> any POD file of the order is accepted ("Order No").
+      - The order is on rows of UNRELATED GT families -> the file name's GT is the
+        tie-breaker: only a file whose GT family is this row's family is accepted
+        ("Order No + GT tie-breaker"). When no file names one of those families the
+        order is AMBIGUOUS: nothing is written and it is reported.
+    Several matching files / orders -> the latest POD date.
 
-    IMPORTANT:
-    GT-only matching is intentionally disabled.
-    A row with only GT Number, or only Order No, will NOT be matched.
+    Returns (record, match_type); (None, "AMBIGUOUS") / (None, "").
     """
 
-    gt = str(
-        gt_number or ""
-    ).strip().upper()
+    row_family = normalize_gt(gt_number)
 
-    order = normalize_order(
-        order_number
-    )
+    best = None
+    best_type = ""
+    ambiguous = False
 
-    # Both fields are mandatory. "Cancelled" (and the other closed markers) in Order No
-    # is a sentinel written by the Full Flow job / GT_FMS, never an order number.
-    if not gt or not order or order.lower() in CLOSED_MARKERS:
-        return None, ""
+    for order in split_orders(order_number):
 
-    gt_norm = normalize_gt(
-        gt
-    )
+        records = pod_index.get(order) or []
+        if not records:
+            continue
 
-    # ========================================================
-    # LOGIC 1
-    # Exact GT + Order
-    # ========================================================
+        families = order_families.get(order) or {row_family}
 
-    key = f"{gt}|{order}"
+        if len(families) <= 1:
+            candidates = records
+            match_type = "Order No"
+        else:
+            candidates = [
+                r for r in records
+                if normalize_gt(r.get("gt", "")) == row_family
+            ]
+            match_type = "Order No + GT tie-breaker"
+            if not any(
+                normalize_gt(r.get("gt", "")) in families for r in records
+            ):
+                ambiguous_orders[order] = (
+                    sorted(families),
+                    sorted({str(r.get("gt", "") or "-") for r in records}),
+                )
+                ambiguous = True
 
-    if key in exact_index:
-        return (
-            exact_index[key],
-            "GT + Order"
-        )
+        for record in candidates:
+            if best is None or record["date"] > best["date"]:
+                best = record
+                best_type = match_type
 
-    # ========================================================
-    # LOGIC 2
-    # Normalized GT + Order
-    # ========================================================
+    if best is not None:
+        return best, best_type
 
-    key = f"{gt_norm}|{order}"
-
-    if key in exact_index:
-        return (
-            exact_index[key],
-            "Normalized GT + Order"
-        )
-
-    # ========================================================
-    # NO GT-ONLY MATCHING
-    # ========================================================
-    #
-    # Previously the script could fall back to:
-    #   GT Only
-    #   Normalized GT Only
-    #
-    # That behavior is now removed.
-    #
-    # Therefore:
-    #   GT present + Order missing -> NO MATCH
-    #   GT missing + Order present -> NO MATCH
-    #   GT present + Order present but not matching -> NO MATCH
-    #
-
-    return None, ""
+    return None, ("AMBIGUOUS" if ambiguous else "")
 
 
 # ============================================================
@@ -1072,14 +1011,18 @@ def is_blank_value(value):
 # lines (P:AW on open lines); Cancel writes "Cancelled" into P:AW. Before 2026-10-09
 # only C / P / AP were checked, so a punched Virtual Invoice line (AJ only) was
 # overwritten with "Delivered" whenever a POD file matched.
-CLOSED_MARKERS = {"cancelled", "virtual invoice", "out of stock", "oos"}
+# 2026-11-16: "rtv" (Return to Vendor) — GT_FMS POD dashboard RTV button writes AJ "RTV"
+# on the invoice's lines (user: "Kindly provide an option to mark the invoice status as
+# "RTV" (Return to Vendor) in the POD Update Sheet."). Without it a matched POD
+# overwrote AJ "RTV" with "Delivered" and filled AP / AU / AV.
+CLOSED_MARKERS = {"cancelled", "virtual invoice", "out of stock", "oos", "rtv"}
 CLOSED_MARKER_COLUMNS = [COL_GT] + list(range(COL_ORDER, COL_AW + 1))   # C, P:AW
 
 
 def row_is_cancelled(row):
     """
-    True if this row is closed (Cancelled / Virtual Invoice / Out of stock / OOS
-    in C or anywhere in P:AW — includes AJ). Closed rows are never written: no
+    True if this row is closed (Cancelled / Virtual Invoice / Out of stock / OOS /
+    RTV in C or anywhere in P:AW — includes AJ). Closed rows are never written: no
     AJ stage, not AP / AU / AV.
     """
     for column_number in CLOSED_MARKER_COLUMNS:
@@ -1118,7 +1061,8 @@ def aj_should_write(current_aj, stage):
 
 def build_sheet_update_requests(values):
     """
-    Match every Full Flow FMS row against the POD index.
+    Match every Full Flow FMS row against the POD index by ORDER NO (2026-11-16;
+    the GT only breaks a tie between unrelated GTs, see find_pod).
 
     IMPORTANT:
     - AP is updated only when currently blank.
@@ -1127,7 +1071,7 @@ def build_sheet_update_requests(values):
     - AJ (Order Delivery Status) moves up the stage ladder
       blank < "Invoiced" (AW) < "Dispatched" (AE AWB) < "Delivered" (POD)
       (2026-11-01). "Delivered" ONLY when a real POD is found. Never written
-      on a closed row (Cancelled / Virtual Invoice / OOS in C or P:AW), never
+      on a closed row (Cancelled / Virtual Invoice / OOS / RTV in C or P:AW), never
       downgraded, never over a non-stage text.
     - Existing manual values are NEVER overwritten (except AJ, which is
       promoted to a higher stage).
@@ -1144,6 +1088,9 @@ def build_sheet_update_requests(values):
     updates = []
     global closed_skipped
     closed_skipped = 0
+    ambiguous_orders.clear()
+
+    order_families = build_order_families(values)
 
     for offset, row in enumerate(values):
         row_num = DATA_START_ROW + offset
@@ -1156,8 +1103,8 @@ def build_sheet_update_requests(values):
         order = get_cell(row, COL_ORDER)
 
         pod, match_type = find_pod(
-            exact_index,
-            gt_index,
+            pod_index,
+            order_families,
             gt,
             order,
         )
@@ -1176,14 +1123,14 @@ def build_sheet_update_requests(values):
 
         matched += 1
 
-        # Closed line (Cancelled / Virtual Invoice / OOS): leave it exactly as is.
+        # Closed line (Cancelled / Virtual Invoice / OOS / RTV): leave it exactly as is.
         if row_is_cancelled(row):
             closed_skipped += 1
             continue
 
-        if match_type == "GT + Order":
+        if match_type == "Order No":
             exact_matches += 1
-        elif match_type == "Normalized GT + Order":
+        elif match_type == "Order No + GT tie-breaker":
             normalized_order_matches += 1
         elif match_type == "GT Only":
             gt_only_matches += 1
@@ -1311,7 +1258,7 @@ def main():
         "AU (POD Link), AV (Delivered Date)"
     )
     print("AJ stages: Invoiced (AW) < Dispatched (AE AWB) < Delivered (confirmed POD); "
-          "only over blank / a lower stage, never on Cancelled / Virtual Invoice / OOS rows.")
+          "only over blank / a lower stage, never on Cancelled / Virtual Invoice / OOS / RTV rows.")
     print("Existing non-blank values will NOT be overwritten.")
 
     # ========================================================
@@ -1340,9 +1287,9 @@ def main():
     # BUILD POD INDEX
     # ========================================================
 
-    global exact_index, gt_index
+    global pod_index
 
-    exact_index, gt_index = build_pod_index(drive)
+    pod_index = build_pod_index(drive)
 
     # ========================================================
     # READ GOOGLE SHEET
@@ -1415,13 +1362,18 @@ def main():
     print(f"Rows checked             : {rows_checked:,}")
     print(f"POD matched              : {matched:,}")
     print(f"POD not found            : {missed:,}")
-    print(f"Closed rows left alone   : {closed_skipped:,} (Cancelled / Virtual Invoice / OOS with a POD)")
+    print(f"Closed rows left alone   : {closed_skipped:,} (Cancelled / Virtual Invoice / OOS / RTV with a POD)")
 
     print("-" * 80)
 
-    print(f"Exact GT + Order         : {exact_matches:,}")
-    print(f"Normalized GT + Order    : {normalized_order_matches:,}")
+    print(f"By Order No (one GT)     : {exact_matches:,}")
+    print(f"Order No + GT tie-break  : {normalized_order_matches:,}")
     print("GT-only matching         : DISABLED")
+    print(f"AMBIGUOUS orders skipped : {len(ambiguous_orders):,} (Order No on unrelated GTs, "
+          "file GT is none of them)")
+    for order, (families, file_gts) in sorted(ambiguous_orders.items()):
+        print(f"  AMBIGUOUS {order}: sheet GTs {', '.join(families)}; "
+              f"file GT {', '.join(file_gts)} -> put the right GT in the file name or fix col P")
 
     print("-" * 80)
 

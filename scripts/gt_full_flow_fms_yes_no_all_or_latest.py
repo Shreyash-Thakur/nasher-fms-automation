@@ -2264,7 +2264,9 @@ BACKFILL_MODE = os.environ.get("BACKFILL_MODE", "dry-run").strip().lower()
 NEW_LINES_FOR_EXISTING_GTS_MAX = 300
 
 # Values that mark a line as closed by a human / earlier job. Such rows are never written.
-CLOSED_MARKERS = {"cancelled", "virtual invoice", "out of stock", "oos"}
+# 2026-11-16: "rtv" (Return to Vendor) — AJ "RTV" from the GT_FMS POD dashboard RTV button
+# closes the line like "Cancelled" (no refresh / fill of a returned invoice's line).
+CLOSED_MARKERS = {"cancelled", "virtual invoice", "out of stock", "oos", "rtv"}
 
 # Output columns in which a closed marker is looked for: J (Order Quantity) and P:AW.
 _P_INDEX = OUTPUT_COLUMNS.index("Order No")
@@ -2311,7 +2313,7 @@ def gt_base(value):
 
 def row_is_closed(row):
     """True when a human or an earlier job closed this line (Cancelled / Virtual
-    Invoice / OOS in J or anywhere in P:AW). Such rows are never written."""
+    Invoice / OOS / RTV in J or anywhere in P:AW). Such rows are never written."""
     for column in CLOSED_MARKER_COLUMNS:
         try:
             value = row[column]

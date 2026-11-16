@@ -22,10 +22,9 @@ def sheet_row(**cells):
 
 @pytest.fixture
 def p(pod, monkeypatch):
-    monkeypatch.setattr(pod, "exact_index", {
-        "GT1|N1": {"date": datetime(2026, 9, 10), "url": "https://drive/x"},
+    monkeypatch.setattr(pod, "pod_index", {
+        "N1": [{"gt": "GT1", "date": datetime(2026, 9, 10), "url": "https://drive/x"}],
     })
-    monkeypatch.setattr(pod, "gt_index", {})
     return pod
 
 
