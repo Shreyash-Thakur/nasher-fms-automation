@@ -49,3 +49,47 @@ def test_open_line_with_pod_is_delivered(with_pod):
     ranges = {u["range"]: u["values"][0][0] for u in updates}
     assert ranges["'Full Flow FMS'!AJ8"] == "Delivered"
     assert "'Full Flow FMS'!AV8" in ranges and "'Full Flow FMS'!AU8" in ranges
+
+
+# 17-Nov-2026 approval-only policy: the nightly job never writes a POD cell.
+def test_nightly_pod_job_never_writes_to_the_sheet(with_pod):
+    class Boom:
+        def spreadsheets(self):
+            raise AssertionError("the nightly POD job called the Sheets API to write")
+
+    rows = [sheet_row(with_pod, C="GT1", P="N1")]
+    *_, updates = with_pod.build_sheet_update_requests(rows)
+    assert updates, "the plan itself still finds the link (reported only)"
+    assert with_pod.POD_WRITES_ENABLED is False
+    assert with_pod.apply_sheet_updates(Boom(), updates) == 0
+
+
+# 17-Nov-2026: the AJ Invoiced / Dispatched stages (from AW / AE, not a POD) still go through; POD cells never do.
+def test_approval_only_keeps_stage_writes_drops_pod_writes(with_pod):
+    sent = []
+
+    class Values:
+        def batchUpdate(self, spreadsheetId=None, body=None):
+            sent.extend(body["data"])
+
+            class R:
+                def execute(self_inner):
+                    return {"totalUpdatedCells": len(body["data"])}
+            return R()
+
+    class Sheets:
+        def spreadsheets(self):
+            class S:
+                def values(self_inner):
+                    return Values()
+            return S()
+
+    updates = [
+        {"range": "'X'!AJ5", "values": [["Invoiced"]], "pod": False},
+        {"range": "'X'!AU6", "values": [["=HYPERLINK(\"u\",\"d\")"]]},
+        {"range": "'X'!AJ6", "values": [["Delivered"]]},
+    ]
+    with_pod.apply_sheet_updates(Sheets(), updates)
+    ranges = [d["range"] for d in sent]
+    assert ranges == ["'X'!AJ5"]
+    assert all("pod" not in d for d in sent)

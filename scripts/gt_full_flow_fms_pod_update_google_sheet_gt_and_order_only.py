@@ -73,6 +73,14 @@ DISPATCHED_TEXT = "Dispatched"
 AJ_STAGE_RANK = {"": 0, INVOICED_TEXT.lower(): 1, DISPATCHED_TEXT.lower(): 2,
                  DELIVERED_TEXT.lower(): 3}
 
+# 17-Nov-2026 POLICY (user: "stop the script from putting any random files in the POD, everything goes via approval"):
+# a POD is written onto a Full Flow FMS row ONLY by a person (dashboard Upload / Replace POD, or Save POD / Approve on a
+# review-panel item). This nightly job therefore NEVER writes AJ / AP / AU / AV: it still matches the Drive files and reports
+# what it WOULD have linked, nothing more. The GT_FMS POD Drive sync (Pod_DriveSync.js) queues the same files for approval in
+# the dashboard's review panel. Do not set this True. Record: Errors and their fixes/2026-11-17-pod-approval-only.md
+# The AJ "Invoiced" / "Dispatched" stages (from AW invoice / AE AWB, not from a POD) are still written.
+POD_WRITES_ENABLED = False
+
 
 # ============================================================
 # GOOGLE DRIVE CONNECTION
@@ -1119,6 +1127,7 @@ def build_sheet_update_requests(values):
                     updates.append({
                         "range": f"'{SHEET_NAME}'!AJ{row_num}",
                         "values": [[stage]],
+                        "pod": False,   # stage from AW / AE, not a POD: allowed under the approval-only policy
                     })
             continue
 
@@ -1215,6 +1224,21 @@ def apply_sheet_updates(sheets, updates):
         print("\nNo AJ/AP/AU/AV cells needed updating.")
         return 0
 
+    if not POD_WRITES_ENABLED:
+        # approval-only policy (17-Nov-2026): POD-based writes (Delivered / AP / AU / AV) are reported, never written;
+        # the AJ Invoiced / Dispatched stages (flag "pod": False) still go through.
+        pod_updates = [u for u in updates if u.get("pod", True)]
+        updates = [u for u in updates if not u.get("pod", True)]
+        print()
+        print("=" * 80)
+        print("APPROVAL-ONLY POLICY: no POD cells written to the Google Sheet")
+        print("=" * 80)
+        print(f"POD cells this job WOULD have written: {len(pod_updates):,} - NOT written. "
+              "Those PODs are queued for approval by the GT_FMS Drive sync (dashboard review panel).")
+        if not updates:
+            return 0
+    updates = [{k: v for k, v in u.items() if k != "pod"} for u in updates]
+
     print()
     print("=" * 80)
     print("UPDATING GOOGLE SHEET")
@@ -1260,6 +1284,8 @@ def main():
     )
     print("AJ stages: Invoiced (AW) < Dispatched (AE AWB) < Delivered (confirmed POD); "
           "only over blank / a lower stage, never on Cancelled / Virtual Invoice / OOS / RTV rows.")
+    print("17-Nov-2026: APPROVAL-ONLY - no POD writes (Delivered / AP / AU / AV; POD_WRITES_ENABLED = False); "
+          "a person approves every POD on the dashboard. Invoiced / Dispatched stages still written.")
     print("Existing non-blank values will NOT be overwritten.")
 
     # ========================================================
@@ -1378,13 +1404,14 @@ def main():
 
     print("-" * 80)
 
+    print("(counts below = what the job WOULD have written; nothing was written - approval-only policy)")
     print(f"AJ marked Delivered      : {aj_updated:,}")
     print(f"AJ marked Dispatched     : {aj_by_stage[DISPATCHED_TEXT]:,} (AE AWB, no POD)")
     print(f"AJ marked Invoiced       : {aj_by_stage[INVOICED_TEXT]:,} (AW Invoice No, no POD / AWB)")
     print(f"AP updated               : {ap_updated:,}")
     print(f"AU links updated         : {au_updated:,}")
     print(f"AV updated               : {av_updated:,}")
-    print(f"Total cells updated      : {updated_cells:,}")
+    print(f"Total cells actually written: {updated_cells:,}")
 
     print("=" * 80)
 
